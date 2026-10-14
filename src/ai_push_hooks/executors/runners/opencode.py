@@ -12,6 +12,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import uuid
 from typing import Any
 
 from .opencode_support import (
@@ -26,10 +27,13 @@ from .opencode_support import (
     validate_hook_owned_artifacts,
 )
 from ...paths import (
+    atomic_write_bytes,
+    relative_path_parts,
     ensure_private_directory,
     resolve_contained_path,
     write_text_no_follow,
 )
+from ...types import RequiredRetentionError
 from .process import ProcessResult
 from .contracts import (
     RunnerCapabilities,
@@ -55,6 +59,284 @@ class OpenCodeRunner:
         supports_finalize=True,
         supports_transcript=True,
     )
+
+    def _required(self, request: RunnerRequest) -> bool:
+        return bool(
+            getattr(
+                self._context(request).config.logging,
+                "require_opencode_retention",
+                False,
+            )
+        )
+
+    def _receipt(self) -> None:
+        atomic_write_bytes(
+            self._retention_dir / "receipt.json",
+            json.dumps(self._retention, sort_keys=True).encode("utf-8"),
+        )
+
+    def _capture(
+        self,
+        completed: ProcessResult | None,
+        action: str,
+        error: BaseException | None = None,
+    ) -> None:
+        metadata = {
+            "available": completed is not None,
+            "exception": type(error).__name__ if error else None,
+        }
+        self._retention[action] = metadata
+        if completed is not None:
+            metadata.update(
+                returncode=completed.returncode,
+                stdout_bytes=len(completed.stdout_bytes),
+                stderr_bytes=len(completed.stderr_bytes),
+                stdout_truncated=completed.stdout_truncated,
+                stderr_truncated=completed.stderr_truncated,
+            )
+            atomic_write_bytes(
+                self._retention_dir / f"{action}.stdout", completed.stdout_bytes
+            )
+            atomic_write_bytes(
+                self._retention_dir / f"{action}.stderr", completed.stderr_bytes
+            )
+        self._receipt()
+
+    @staticmethod
+    def _complete_process(completed: ProcessResult) -> str:
+        if (
+            completed.returncode != 0
+            or completed.stdout_truncated
+            or completed.stderr_truncated
+        ):
+            raise RequiredRetentionError(
+                "Required OpenCode retention: incomplete process output"
+            )
+        try:
+            completed.stderr_bytes.decode("utf-8")
+            raw = completed.stdout_bytes.decode("utf-8")
+        except UnicodeError as exc:
+            raise RequiredRetentionError(
+                "Required OpenCode retention: invalid encoding"
+            ) from exc
+        if (
+            raw != completed.stdout
+            or completed.stderr_bytes.decode("utf-8") != completed.stderr
+        ):
+            raise RequiredRetentionError(
+                "Required OpenCode retention: original bytes unavailable"
+            )
+        return raw
+
+    @staticmethod
+    def _has_error(value: Any) -> bool:
+        if isinstance(value, dict):
+            return value.get("type") in {"error", "fatal", "session.error"} or any(
+                (key == "error" and item is not None) or OpenCodeRunner._has_error(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(OpenCodeRunner._has_error(item) for item in value)
+        return False
+
+    def _parse_required(self, raw: str, request: RunnerRequest) -> tuple[str, str]:
+        ids: set[str] = set()
+        message_ids: set[str] = set()
+        texts: list[str] = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict) or self._has_error(event):
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: invalid/error event"
+                )
+            sid = event.get("sessionID")
+            if not isinstance(sid, str) or not sid.strip():
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: missing root identity"
+                )
+            ids.add(sid)
+            if event.get("type") in {"text", "step_start", "step_finish"}:
+                part = event.get("part")
+                if (
+                    not isinstance(part, dict)
+                    or part.get("sessionID") != sid
+                    or part.get("type") != event["type"].replace("_", "-")
+                ):
+                    raise RequiredRetentionError(
+                        "Required OpenCode retention: invalid part identity/type"
+                    )
+                mid = part.get("messageID")
+                if not isinstance(mid, str) or not mid.strip():
+                    raise RequiredRetentionError(
+                        "Required OpenCode retention: missing message identity"
+                    )
+                message_ids.add(mid)
+                if event["type"] == "text":
+                    if not isinstance(part.get("text"), str):
+                        raise RequiredRetentionError(
+                            "Required OpenCode retention: invalid text"
+                        )
+                    texts.append(part["text"])
+        if len(ids) != 1 or (request.resume_session and ids != {request.session_id}):
+            raise RequiredRetentionError(
+                "Required OpenCode retention: ambiguous session identity"
+            )
+        text = "\n".join(texts).strip()
+        if not text:
+            raise RequiredRetentionError(
+                "Required OpenCode retention: missing final text"
+            )
+        sid = next(iter(ids))
+        self._retention.update(
+            session_id=sid,
+            message_ids=sorted(message_ids),
+            run_validated=True,
+            outcome="retained",
+        )
+        self._receipt()
+        return sid, text
+
+    def _finalize_required(
+        self, request: RunnerRequest, result: RunnerResult
+    ) -> RunnerResult:
+        context = self._context(request)
+        if (
+            not getattr(self, "_retention", {}).get("run_validated")
+            or result.returncode != 0
+        ):
+            raise RequiredRetentionError(
+                "Required OpenCode retention: failed run retained; deletion forbidden"
+            )
+        sid = self._retention["session_id"]
+        executable = self._retention["executable"]
+        try:
+            try:
+                exported = self._lifecycle_process(
+                    request, context, [executable, "export", sid, "--pure"], "export"
+                )
+            except Exception as exc:
+                self._capture(getattr(exc, "_process_result", None), "export", exc)
+                raise
+            self._capture(exported, "export")
+            payload = json.loads(self._complete_process(exported))
+            if (
+                not isinstance(payload, dict)
+                or self._has_error(payload)
+                or not isinstance(payload.get("info"), dict)
+                or payload["info"].get("id") != sid
+            ):
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: invalid export identity"
+                )
+            messages = payload.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: empty export messages"
+                )
+            assistant_ids = set()
+            for message in messages:
+                if (
+                    not isinstance(message, dict)
+                    or not isinstance(message.get("type"), str)
+                    or not isinstance(message.get("id"), str)
+                ):
+                    raise RequiredRetentionError(
+                        "Required OpenCode retention: invalid export message"
+                    )
+                if message["type"] == "assistant":
+                    content = message.get("content")
+                    if (
+                        not isinstance(content, list)
+                        or not content
+                        or not message["id"].strip()
+                    ):
+                        raise RequiredRetentionError(
+                            "Required OpenCode retention: invalid assistant content"
+                        )
+                    for part in content:
+                        if not isinstance(part, dict) or part.get("type") not in {
+                            "text",
+                            "reasoning",
+                            "tool",
+                        }:
+                            raise RequiredRetentionError(
+                                "Required OpenCode retention: invalid content type"
+                            )
+                        if part["type"] in {"text", "reasoning"} and not isinstance(
+                            part.get("text"), str
+                        ):
+                            raise RequiredRetentionError(
+                                "Required OpenCode retention: invalid content text"
+                            )
+                        if part["type"] == "tool" and (
+                            not isinstance(part.get("id"), str)
+                            or not isinstance(part.get("name"), str)
+                            or not isinstance(part.get("state"), dict)
+                        ):
+                            raise RequiredRetentionError(
+                                "Required OpenCode retention: invalid tool content"
+                            )
+                    assistant_ids.add(message["id"])
+            if not set(self._retention["message_ids"]).issubset(assistant_ids):
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: missing export correlation"
+                )
+            self._retention["export_validated"] = True
+            deleting = context.config.llm.delete_session_after_run
+            self._retention.update(
+                delete_action="intent" if deleting else "not requested",
+                outcome="retained",
+            )
+            self._receipt()
+            if deleting:
+                self._retention.update(delete_action="attempted", outcome="unknown")
+                self._receipt()
+                try:
+                    deleted = self._lifecycle_process(
+                        request,
+                        context,
+                        [executable, "session", "delete", sid, "--pure"],
+                        "delete",
+                    )
+                except Exception as exc:
+                    self._capture(getattr(exc, "_process_result", None), "delete", exc)
+                    raise
+                self._capture(deleted, "delete")
+                self._complete_process(deleted)
+                self._retention["outcome"] = "deleted"
+            self._receipt()
+            return RunnerResult(
+                final_text=result.final_text,
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                session=SessionMetadata(
+                    session_id=sid,
+                    state="deleted" if deleting else "persisted",
+                    resumable=not deleting,
+                    transcript=str(self._retention_dir / "export.stdout"),
+                ),
+            )
+        except Exception as exc:
+            self._retention["lifecycle_error"] = type(exc).__name__
+            if self._retention.get("outcome") == "deleted":
+                self._retention["outcome"] = "unknown"
+            try:
+                self._receipt()
+            except Exception as receipt_error:
+                error = RequiredRetentionError(
+                    "Required OpenCode retention: lifecycle and receipt failed; outcome unknown"
+                )
+                error.primary_error = exc
+                error.secondary_error = receipt_error
+                raise error from exc
+            error = RequiredRetentionError(
+                "Required OpenCode retention: lifecycle failed; receipt/outcome may be unavailable"
+            )
+            error.secondary_error = exc
+            raise error from exc
 
     def _context(self, request: RunnerRequest) -> Any:
         context = request.integration_context
@@ -296,6 +578,48 @@ class OpenCodeRunner:
                 f"OpenCode runner cannot handle runner type {request.runner_type!r}"
             )
         context = self._context(request)
+        required = self._required(request)
+        if required:
+            if (
+                not context.config.logging.capture_llm_transcript
+                or context.config.general.allow_push_on_error
+            ):
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: incompatible policy"
+                )
+            try:
+                parts = relative_path_parts(
+                    context.config.logging.transcript_dir,
+                    "Required transcript directory",
+                )
+                root = (
+                    context.git_dir.joinpath(*parts[1:])
+                    if parts[0] == ".git"
+                    else context.repo_root.joinpath(*parts)
+                )
+                ensure_private_directory(root, durable=True)
+                self._retention_dir = (
+                    root
+                    / f"{sanitize_filename_component(context.run_id)}-{sanitize_filename_component(request.stage)}-{uuid.uuid4().hex}"
+                )
+                ensure_private_directory(
+                    self._retention_dir, private_root=root, durable=True, exclusive=True
+                )
+                self._retention = {
+                    "run_id": context.run_id,
+                    "stage": request.stage,
+                    "resume_session": request.session_id
+                    if request.resume_session
+                    else None,
+                    "run_validated": False,
+                    "delete_action": "not attempted",
+                    "outcome": "unknown",
+                }
+                self._receipt()
+            except Exception as exc:
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: storage unavailable"
+                ) from exc
         if request.mode == "apply" and not request.allow_paths:
             raise RunnerContractError("OpenCode apply requests require allow_paths")
         if request.mode == "apply" and request.project_access == "artifacts":
@@ -337,6 +661,8 @@ class OpenCodeRunner:
             or resolve_opencode_executable()
         )
         isolated_env = opencode_isolation_env(context, security_config, request.stage)
+        if required:
+            self._retention["executable"] = executable
         attachment_dir: pathlib.Path | None = None
         session_id: str | None = None
         try:
@@ -356,12 +682,32 @@ class OpenCodeRunner:
             )
 
             def invoke(cwd: pathlib.Path) -> Any:
-                completed = run_process(
-                    argv,
-                    cwd=cwd,
-                    timeout_seconds=request.timeout_seconds,
-                    env=isolated_env,
-                )
+                try:
+                    completed = run_process(
+                        argv,
+                        cwd=cwd,
+                        timeout_seconds=request.timeout_seconds,
+                        env=isolated_env,
+                    )
+                except Exception as exc:
+                    if required:
+                        try:
+                            self._capture(
+                                getattr(exc, "_process_result", None), "run", exc
+                            )
+                        except Exception as secondary:
+                            error = RequiredRetentionError(
+                                "Required OpenCode retention: process and capture failed"
+                            )
+                            error.secondary_error = secondary
+                            raise error from exc
+                        raise RequiredRetentionError(
+                            "Required OpenCode retention: process failed"
+                        ) from exc
+                    raise
+                if required:
+                    self._capture(completed, "run")
+                    self._complete_process(completed)
                 if getattr(completed, "stdout_truncated", False) or getattr(
                     completed, "stderr_truncated", False
                 ):
@@ -418,7 +764,11 @@ class OpenCodeRunner:
                     or (request.session_id if request.resume_session else None),
                 )
                 raise
-            session_id, final_text = self._parse_output(completed.stdout, request)
+            session_id, final_text = (
+                self._parse_required(completed.stdout, request)
+                if required
+                else self._parse_output(completed.stdout, request)
+            )
             if request.resume_session and session_id is None:
                 session_id = request.session_id
             return RunnerResult(
@@ -434,6 +784,22 @@ class OpenCodeRunner:
                     else SessionMetadata()
                 ),
             )
+        except Exception as exc:
+            if required:
+                self._retention["run_error"] = type(exc).__name__
+                try:
+                    self._receipt()
+                except Exception as secondary:
+                    error = RequiredRetentionError(
+                        "Required OpenCode retention: run and receipt failed; outcome unknown"
+                    )
+                    error.secondary_error = secondary
+                    raise error from exc
+            if required and not isinstance(exc, RequiredRetentionError):
+                raise RequiredRetentionError(
+                    "Required OpenCode retention: run/capture failed; session retained"
+                ) from exc
+            raise
         finally:
             active_error = sys.exc_info()[1]
             cleanup_session_id = session_id or getattr(active_error, "session_id", None)
@@ -470,6 +836,8 @@ class OpenCodeRunner:
             )
 
     def finalize(self, request: RunnerRequest, result: RunnerResult) -> RunnerResult:
+        if self._required(request):
+            return self._finalize_required(request, result)
         session = result.session
         if session is None or not session.session_id:
             return result

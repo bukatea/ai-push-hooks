@@ -5,6 +5,7 @@ import pathlib
 import stat
 import tempfile
 import unicodedata
+import uuid
 
 from .types import HookError
 
@@ -120,8 +121,42 @@ def ensure_private_directory(
     path: pathlib.Path,
     *,
     private_root: pathlib.Path | None = None,
+    durable: bool = False,
+    exclusive: bool = False,
 ) -> pathlib.Path:
     target = pathlib.Path(os.path.abspath(path))
+    if durable:
+        if os.name != "posix":
+            raise HookError(
+                "Required durable storage needs POSIX no-follow directory descriptors"
+            )
+        if private_root is not None and not is_path_within(
+            target, pathlib.Path(os.path.abspath(private_root))
+        ):
+            raise HookError("Private runtime directory escapes its namespace")
+        descriptor = _open_directory(target, create=True, exclusive_leaf=exclusive)
+        try:
+            if os.fstat(descriptor).st_uid != os.geteuid():
+                raise HookError("Private runtime directory is not owned by this user")
+            os.fchmod(descriptor, PRIVATE_DIRECTORY_MODE)
+            os.fsync(descriptor)
+            # An existing entry may survive mkdir after a previous parent-sync
+            # failure. Require its parent durability on every strict invocation.
+            parent_descriptor = _open_directory(target.parent)
+            try:
+                child = os.fstat(descriptor)
+                entry = os.stat(
+                    target.name, dir_fd=parent_descriptor, follow_symlinks=False
+                )
+                if (child.st_dev, child.st_ino) != (entry.st_dev, entry.st_ino):
+                    raise HookError("Private runtime directory changed concurrently")
+                os.fsync(parent_descriptor)
+                _check_directory_identity(target, descriptor)
+            finally:
+                os.close(parent_descriptor)
+        finally:
+            os.close(descriptor)
+        return target
     if private_root is None:
         missing: list[pathlib.Path] = []
         current = target
@@ -161,16 +196,125 @@ def ensure_private_directory(
     return target
 
 
+def _open_directory(
+    path: pathlib.Path, *, create: bool = False, exclusive_leaf: bool = False
+) -> int:
+    """Pin every ancestor without following links; persist newly created entries."""
+    absolute = pathlib.Path(os.path.abspath(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for index, component in enumerate(absolute.parts[1:], start=1):
+            if exclusive_leaf and index == len(absolute.parts) - 1:
+                # The invocation leaf must never reuse an earlier evidence namespace.
+                os.mkdir(component, PRIVATE_DIRECTORY_MODE, dir_fd=descriptor)
+                os.fsync(descriptor)
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, PRIVATE_DIRECTORY_MODE, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                os.fsync(descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            metadata = os.fstat(child)
+            if metadata.st_uid not in {0, os.geteuid()}:
+                os.close(child)
+                raise HookError("Runtime storage ancestor is foreign-owned")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _check_directory_identity(path: pathlib.Path, descriptor: int) -> None:
+    current = _open_directory(path)
+    try:
+        original_stat, current_stat = os.fstat(descriptor), os.fstat(current)
+        if (original_stat.st_dev, original_stat.st_ino) != (
+            current_stat.st_dev,
+            current_stat.st_ino,
+        ):
+            raise HookError("Runtime storage directory changed concurrently")
+    finally:
+        os.close(current)
+
+
 def atomic_write_bytes(
     path: pathlib.Path,
     content: bytes,
     *,
     mode: int = PRIVATE_FILE_MODE,
 ) -> None:
-    parent = path.parent.resolve(strict=True)
+    if os.name == "posix":
+        parent_fd = _open_directory(path.parent)
+        temporary_name = ".ai-push-hooks-" + uuid.uuid4().hex
+        descriptor = -1
+        try:
+            if os.fstat(parent_fd).st_uid != os.geteuid():
+                raise HookError("Atomic write parent is foreign-owned")
+
+            def validate_target() -> None:
+                try:
+                    metadata = os.stat(
+                        path.name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    return
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                ):
+                    raise HookError(
+                        "Atomic write target must be an owned regular file, not symlink or reparse point"
+                    )
+
+            validate_target()
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+                dir_fd=parent_fd,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(content)
+                handle.flush()
+                os.fchmod(handle.fileno(), sanitize_file_mode(mode))
+                os.fsync(handle.fileno())
+            _check_directory_identity(path.parent, parent_fd)
+            validate_target()
+            os.replace(
+                temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
+            os.fsync(parent_fd)
+            _check_directory_identity(path.parent, parent_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(parent_fd)
+        return
+    lexical_parent = pathlib.Path(os.path.abspath(path.parent))
+    if any(
+        path_is_link_or_reparse(p) for p in (lexical_parent, *lexical_parent.parents)
+    ):
+        raise HookError("Atomic write parent traverses a symlink or reparse point")
+    parent = lexical_parent.resolve(strict=True)
     target = parent / path.name
     if path_is_link_or_reparse(target):
         raise HookError(f"Refusing to replace symlink or reparse point: {target}")
+    if target.exists() and not stat.S_ISREG(target.lstat().st_mode):
+        raise HookError("Atomic write target must be a regular file")
     descriptor, temporary_name = tempfile.mkstemp(prefix=".ai-push-hooks-", dir=parent)
     temporary_path = pathlib.Path(temporary_name)
     try:

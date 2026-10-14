@@ -58,6 +58,165 @@ def _success() -> RunnerResult:
     return RunnerResult(final_text="", returncode=0, stdout="", stderr="")
 
 
+@pytest.mark.parametrize("failure", ["export", "delete"])
+def test_strict_actual_apply_preserves_policy_and_checkout(
+    tmp_path, monkeypatch, failure
+):
+    import json
+    from ai_push_hooks.executors.runners import ProcessResult
+    from ai_push_hooks.types import RequiredRetentionError
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    config = replace(
+        config, logging=replace(config.logging, require_opencode_retention=True)
+    )
+    context = build_context(repo, config)
+    context.opencode_executable = "/fixture/opencode"
+    context.run_dir = repo / ".git" / "ai-push-hooks" / "runs" / "strict-apply"
+    context.run_dir.mkdir(parents=True)
+    before = (repo / "README.md").read_bytes()
+    completions = []
+    calls = []
+    monkeypatch.setattr(
+        context.logger,
+        "llm_complete",
+        lambda *args, **kwargs: completions.append(kwargs),
+    )
+
+    def process(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "run":
+            assert kwargs["cwd"] != repo
+            (kwargs["cwd"] / "README.md").write_text("staged change\n")
+            payload = {
+                "type": "text",
+                "sessionID": "s1",
+                "part": {
+                    "type": "text",
+                    "sessionID": "s1",
+                    "messageID": "msg_1",
+                    "text": "done",
+                },
+            }
+        else:
+            payload = {
+                "info": {"id": "s1"},
+                "messages": [
+                    {
+                        "id": "msg_1",
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": "done"}],
+                    }
+                ],
+            }
+        raw = (
+            b"{}"
+            if failure == "export" and argv[1] == "export"
+            else json.dumps(payload).encode()
+            if argv[1] != "session"
+            else b""
+        )
+        return ProcessResult(
+            1 if argv[1] == "session" else 0, raw.decode(), "", stdout_bytes=raw
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    with pytest.raises(RequiredRetentionError) as caught:
+        _run(
+            context,
+            replace(config.modules["docs"].steps[3], auto_commit=False),
+            _issues_artifact(context),
+        )
+    assert isinstance(caught.value.__cause__, RequiredRetentionError)
+    assert (repo / "README.md").read_bytes() == before
+    assert calls == (
+        ["run", "export"] if failure == "export" else ["run", "export", "session"]
+    )
+    assert completions[-1]["session_state"] == "unknown"
+    assert completions[-1]["resumable"] is False
+
+
+@pytest.mark.parametrize("allow_error", ["true", "false"])
+def test_strict_actual_apply_hook_blocks_late_fail_open(
+    tmp_path, monkeypatch, allow_error
+):
+    import json
+    from ai_push_hooks.hook import run_hook
+    from ai_push_hooks.executors.runners import ProcessResult
+    from ai_push_hooks.types import RequiredRetentionError
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    (repo / "ai-push-hooks.toml").write_text("""
+[logging]
+require_opencode_retention = true
+[workflow]
+modules = ["check"]
+[[modules.check.steps]]
+id = "fix"
+type = "apply"
+prompt = "Update README"
+allow_paths = ["README.md"]
+""")
+    before = (repo / "README.md").read_bytes()
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "run":
+            (kwargs["cwd"] / "README.md").write_text("staged change\n")
+            payload = {
+                "type": "text",
+                "sessionID": "s1",
+                "part": {
+                    "type": "text",
+                    "sessionID": "s1",
+                    "messageID": "msg_1",
+                    "text": "done",
+                },
+            }
+        else:
+            payload = {
+                "info": {"id": "s1"},
+                "messages": [
+                    {
+                        "id": "msg_1",
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": "done"}],
+                    }
+                ],
+            }
+        if argv[1] == "session":
+            # Change only after effective config validation, exercising outer catch.
+            monkeypatch.setenv("AI_PUSH_HOOKS_ALLOW_PUSH_ON_ERROR", allow_error)
+        raw = json.dumps(payload).encode() if argv[1] != "session" else b""
+        return ProcessResult(
+            1 if argv[1] == "session" else 0, raw.decode(), "", stdout_bytes=raw
+        )
+
+    monkeypatch.setattr(
+        "ai_push_hooks.executors.runners.opencode.resolve_opencode_executable",
+        lambda: "/fixture/opencode",
+    )
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    with pytest.raises(RequiredRetentionError):
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        run_hook(
+            cwd=repo,
+            stdin_lines=[
+                f"refs/heads/feature/docs {sha} refs/heads/feature/docs {'0' * 40}"
+            ],
+        )
+    assert calls == ["run", "export", "session"]
+    assert (repo / "README.md").read_bytes() == before
+
+
 def test_project_apply_projection_is_broad_but_propagation_stays_allowlisted(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

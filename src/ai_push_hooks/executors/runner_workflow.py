@@ -10,11 +10,17 @@ from __future__ import annotations
 import os
 import pathlib
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..config import resolve_runner_profile
 from ..paths import is_path_within, path_has_symlink
-from ..types import HookError, RunnerProfile, RuntimeContext, StepConfig
+from ..types import (
+    HookError,
+    RequiredRetentionError,
+    RunnerProfile,
+    RuntimeContext,
+    StepConfig,
+)
 from .runners import (
     Runner,
     RunnerArtifact,
@@ -213,6 +219,14 @@ def _failure_result(
     error: BaseException,
     fallback_session_id: str | None = None,
 ) -> RunnerResult:
+    if isinstance(error, RequiredRetentionError):
+        return RunnerResult(
+            final_text="",
+            returncode=1,
+            stdout="",
+            stderr="",
+            session=SessionMetadata(state="unknown"),
+        )
     session_id = getattr(error, "session_id", None)
     if not isinstance(session_id, str) or not session_id.strip():
         session_id = fallback_session_id
@@ -343,7 +357,12 @@ def _named_error(
     message = f"Runner profile `{profile_name}` ({runner_type}) failed at stage `{stage_name}`"
     if details:
         message += f": {details}"
-    return HookError(message)
+    error_type = (
+        RequiredRetentionError
+        if isinstance(error, RequiredRetentionError)
+        else HookError
+    )
+    return error_type(message)
 
 
 def _invoke_runner(
@@ -393,6 +412,13 @@ def _invoke_runner(
             try:
                 _finalize_invocation(context, prior_invocation, failed=True)
             except Exception as finalize_error:  # noqa: BLE001
+                if isinstance(finalize_error, RequiredRetentionError):
+                    combined = RequiredRetentionError(
+                        "Required OpenCode retention: preparation and prior finalization failed"
+                    )
+                    combined.primary_error = exc
+                    combined.secondary_error = finalize_error
+                    raise combined from exc
                 context.logger.warn(
                     "llm.finalize_failed",
                     "Runner lifecycle finalization failed while cleaning a retained retry session.",
@@ -428,6 +454,14 @@ def _invoke_runner(
         try:
             invocation.result = finalize_runner(runner, request, result)
         except Exception as finalize_error:  # noqa: BLE001
+            if isinstance(finalize_error, RequiredRetentionError):
+                combined = RequiredRetentionError(
+                    f"Required OpenCode retention: {type(exc).__name__}; lifecycle {type(finalize_error).__name__}"
+                )
+                combined.primary_error = exc
+                combined.secondary_error = finalize_error
+                _completion(context, invocation, failed=True)
+                raise combined from exc
             context.logger.warn(
                 "llm.finalize_failed",
                 "Runner lifecycle finalization failed after a runner error.",
@@ -461,6 +495,16 @@ def _finalize_invocation(
             invocation.result,
         )
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, RequiredRetentionError):
+            prior_session = invocation.result.session
+            invocation.result = replace(
+                invocation.result,
+                session=SessionMetadata(
+                    session_id=prior_session.session_id if prior_session else None,
+                    state="unknown",
+                    resumable=False,
+                ),
+            )
         _completion(context, invocation, failed=True)
         raise _named_error(
             invocation.request.profile_id,

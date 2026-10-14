@@ -65,6 +65,7 @@ LOGGING_KEYS = {
     "jsonl",
     "dir",
     "capture_llm_transcript",
+    "require_opencode_retention",
     "transcript_dir",
     "summary_dir",
     "print_llm_output",
@@ -599,7 +600,12 @@ def _validate_config_types(raw: dict[str, Any]) -> None:
     _validate_unknown_keys(logging, LOGGING_KEYS, "logging")
     for key in ("level", "dir", "transcript_dir", "summary_dir"):
         _validate_string(logging, key, "logging")
-    for key in ("jsonl", "capture_llm_transcript", "print_llm_output"):
+    for key in (
+        "jsonl",
+        "capture_llm_transcript",
+        "print_llm_output",
+        "require_opencode_retention",
+    ):
         _validate_bool(logging, key, "logging")
 
     workflow = _require_table(raw.get("workflow", {}), "workflow")
@@ -868,6 +874,14 @@ def _build_config(
     general = GeneralConfig(**raw.get("general", {}))
     llm = LlmConfig(**raw.get("llm", {}))
     logging = LoggingConfig(**raw.get("logging", {}))
+    if logging.require_opencode_retention and (
+        not logging.capture_llm_transcript or general.allow_push_on_error
+    ):
+        from .types import RequiredRetentionError
+
+        raise RequiredRetentionError(
+            "Required OpenCode retention requires capture_llm_transcript=true and allow_push_on_error=false"
+        )
     runner_payload = raw.get("runners", {})
     runners = {
         name: _normalize_runner_profile(name, profile)
@@ -1142,13 +1156,38 @@ def load_config(repo_root: pathlib.Path) -> tuple[HookConfig, pathlib.Path]:
         )
     model_override = os.getenv("AI_PUSH_HOOKS_MODEL")
     variant_override = os.getenv("AI_PUSH_HOOKS_VARIANT")
-    _validate_model_override(model_override)
-    _validate_variant_override(variant_override)
-    return _apply_env_overrides(
-        _build_config(loaded, effective_model=model_override, repo_root=None),
-        repo_root=repo_root,
-        raw_modules=loaded.get("modules", {}),
-    ), config_path
+    logging_raw = loaded.get("logging")
+    required = (
+        isinstance(logging_raw, dict)
+        and logging_raw.get("require_opencode_retention") is True
+    )
+    try:
+        if required and isinstance(loaded.get("general", {}), dict):
+            # Validate policy against effective precedence, not the TOML intermediate.
+            override = env_bool("AI_PUSH_HOOKS_ALLOW_PUSH_ON_ERROR")
+            if override is not None:
+                loaded = {
+                    **loaded,
+                    "general": {
+                        **loaded.get("general", {}),
+                        "allow_push_on_error": override,
+                    },
+                }
+        _validate_model_override(model_override)
+        _validate_variant_override(variant_override)
+        return _apply_env_overrides(
+            _build_config(loaded, effective_model=model_override, repo_root=None),
+            repo_root=repo_root,
+            raw_modules=loaded.get("modules", {}),
+        ), config_path
+    except HookError as exc:
+        if required:
+            from .types import RequiredRetentionError
+
+            raise RequiredRetentionError(
+                "Required OpenCode retention: effective configuration rejected"
+            ) from exc
+        raise
 
 
 def resolve_prompt_text(repo_root: pathlib.Path, step: StepConfig) -> str:

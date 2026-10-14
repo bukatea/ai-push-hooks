@@ -38,6 +38,22 @@ policy; it does not claim that a transcript was captured. A provider may have
 already received the request even when local export fails. Do not use local
 transcript files as proof that provider-side data was deleted.
 
+Opt-in `logging.require_opencode_retention = true` requires transcript capture
+and forbids `general.allow_push_on_error = true`, including environment overrides.
+For OpenCode only, bounded original stdout/stderr and lifecycle receipts are
+private, byte-preserving artifacts. Incomplete capture or uncorrelated export
+blocks success and deletion; deletion failure or an unavailable completion
+receipt also blocks success. `llm.delete_session_after_run = false` retains the
+session but still requires capture and export. These artifacts may contain
+sensitive repository/provider data; they do not prove provider-side deletion.
+The strict reader targets native root `sessionID`/`part.messageID` events and
+`{info,messages}` exports with assistant message IDs. CLI-generation compatibility
+is not established by synthetic tests: the unchanged `--pure` lifecycle commands
+are not a claim of OpenCode 2.0.25 support. Default best-effort behavior is unchanged.
+Strict JSON repair with retries requires fresh sessions; configured reuse is
+rejected before invocation. Strict durable storage requires POSIX directory
+descriptors and otherwise fails closed. Ambiguous deletion is recorded as unknown.
+
 ## Repository callbacks and commands
 
 The npm launcher uses Python isolated mode to prevent the consuming checkout,

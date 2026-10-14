@@ -1,5 +1,37 @@
 # Configuration
 
+## Required OpenCode retention (opt-in proposal)
+
+```toml
+[logging]
+require_opencode_retention = false # default: existing best-effort behavior
+```
+
+Set true only with `capture_llm_transcript = true` and effective
+`general.allow_push_on_error = false` (environment overrides are checked).
+Only OpenCode is affected, including named OpenCode profiles. Each invocation
+gets a private unique transcript directory containing original bounded run/export
+streams and a lifecycle receipt. Capture, identity, correlated export, deletion,
+or receipt failures block success without model/deletion retries. No deletion is
+attempted after capture/export failure. Set `llm.delete_session_after_run = false`
+to retain sessions while still requiring capture/export. Explicit hook skip is
+outside this guarantee. Artifacts can contain sensitive data; keep them private.
+
+Strict JSON repair requires `llm.json_retry_new_session = true` whenever JSON
+retries are enabled; reused-session JSON repair is rejected before invocation.
+Default best-effort reused repair remains supported. Required durable storage
+currently requires POSIX no-follow directory descriptors; unsupported platforms
+reject strict mode rather than weaken its storage guarantee. Ambiguous deletion
+(including nonzero exit, timeout or incomplete capture) reports unknown, not retained.
+
+The strict source reader expects root `sessionID`, matching typed text/step parts
+with `messageID`, and export root `{info,messages}` with matching `info.id` and
+typed assistant `messages[].id`/`content`. It allows extra fields and split text;
+it does not synthesize missing native evidence. The invocation syntax remains
+unchanged. Synthetic tests do not establish compatibility with installed OpenCode
+2.0.25 or the historical 1.18.29 smoke gate. Maintainer CLI-generation acceptance
+and release are separate gates; this proposal alone is not live retention proof.
+
 Define workflows in `ai-push-hooks.toml` at the repository root. Start with the [README example](../README.md#example-check-your-rules) or the [starter configuration](../ai-push-hooks.toml).
 
 ## Installation

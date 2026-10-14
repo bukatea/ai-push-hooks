@@ -19,6 +19,50 @@ from ai_push_hooks.types import HookError
 from .conftest import build_context, init_repo
 
 
+@pytest.mark.parametrize("reuse", [True, False])
+def test_strict_ask_repair_never_bypasses_export(tmp_path, monkeypatch, reuse):
+    import json
+    from ai_push_hooks.executors.runners import ProcessResult
+    from ai_push_hooks.types import RequiredRetentionError, StepConfig
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    config = replace(
+        config,
+        logging=replace(config.logging, require_opencode_retention=True),
+        llm=replace(config.llm, json_retry_new_session=not reuse),
+    )
+    context = build_context(repo, config)
+    context.opencode_executable = "/fixture/opencode"
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv[1])
+        event = {
+            "type": "text",
+            "sessionID": "s1",
+            "part": {
+                "type": "text",
+                "sessionID": "s1",
+                "messageID": "msg_1",
+                "text": "invalid JSON",
+            },
+        }
+        raw = json.dumps(event).encode() if argv[1] == "run" else b"{}"
+        return ProcessResult(0, raw.decode(), "", stdout_bytes=raw)
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    with pytest.raises(RequiredRetentionError):
+        run_ask_step(
+            context,
+            StepConfig(id="strict", type="ask", schema="string_array"),
+            "instruction",
+            [],
+            "docs.strict",
+        )
+    assert calls == ([] if reuse else ["run", "export"])
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("title", True), ("body", 123), ("draft", "false"), ("draft", 1)],

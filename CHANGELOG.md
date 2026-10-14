@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Propose opt-in `logging.require_opencode_retention` (default false): private
+  byte-preserving OpenCode capture, identity-correlated export, and fail-closed
+  lifecycle receipts. Best-effort defaults and other providers are unchanged.
+  Strict capture is incompatible with fail-open. Native CLI-generation
+  compatibility and maintainer release acceptance remain unverified.
+
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]

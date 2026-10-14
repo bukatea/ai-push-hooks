@@ -14,6 +14,195 @@ from ai_push_hooks.types import HookError
 from .conftest import init_repo
 
 
+def test_required_retention_is_opt_in(tmp_path):
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    assert config.logging.require_opencode_retention is False
+    path = repo / "ai-push-hooks.toml"
+    path.write_text(
+        path.read_text().replace(
+            "[logging]", "[logging]\nrequire_opencode_retention = true"
+        )
+    )
+    config, _ = load_config(repo)
+    assert config.logging.require_opencode_retention is True
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        "capture_llm_transcript = false",
+        "require_opencode_retention = 'true'",
+        "require_opencode_retention = 1",
+    ],
+)
+def test_required_retention_rejects_invalid_settings(tmp_path, settings):
+    repo = init_repo(tmp_path, branch="feature/docs")
+    path = repo / "ai-push-hooks.toml"
+    text = path.read_text()
+    if settings.startswith("capture"):
+        text = text.replace(
+            "capture_llm_transcript = true", "capture_llm_transcript = false"
+        )
+        settings = "require_opencode_retention = true"
+    path.write_text(text.replace("[logging]", "[logging]\n" + settings))
+    with pytest.raises(HookError):
+        load_config(repo)
+
+
+def test_required_retention_outer_hook_rejects_environment_fail_open(
+    tmp_path, monkeypatch
+):
+    from ai_push_hooks.hook import run_hook
+    from ai_push_hooks.types import RequiredRetentionError
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    path = repo / "ai-push-hooks.toml"
+    path.write_text(
+        path.read_text().replace(
+            "[logging]", "[logging]\nrequire_opencode_retention = true"
+        )
+    )
+    monkeypatch.setenv("AI_PUSH_HOOKS_ALLOW_PUSH_ON_ERROR", "true")
+    with pytest.raises(RequiredRetentionError):
+        run_hook(cwd=repo)
+
+
+@pytest.mark.parametrize("failure", ["unknown", "numeric", "model"])
+def test_strict_early_config_errors_never_fail_open(tmp_path, monkeypatch, failure):
+    from ai_push_hooks.hook import run_hook
+    from ai_push_hooks.types import RequiredRetentionError
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    path = repo / "ai-push-hooks.toml"
+    text = path.read_text().replace(
+        "[logging]", "[logging]\nrequire_opencode_retention = true"
+    )
+    if failure == "unknown":
+        text = text.replace("[general]", "[general]\nunknown = true")
+    elif failure == "numeric":
+        text = re.sub(
+            r"(?m)^max_parallel\s*=.*$", "max_parallel = 'invalid'", text, count=1
+        )
+    else:
+        monkeypatch.setenv("AI_PUSH_HOOKS_MODEL", "invalid model\n")
+    path.write_text(text)
+    monkeypatch.setenv("AI_PUSH_HOOKS_ALLOW_PUSH_ON_ERROR", "true")
+    with pytest.raises(RequiredRetentionError):
+        run_hook(cwd=repo)
+
+
+def test_strict_effective_false_override_accepts_toml_fail_open(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path, branch="feature/docs")
+    path = repo / "ai-push-hooks.toml"
+    text = path.read_text().replace(
+        "[logging]", "[logging]\nrequire_opencode_retention = true"
+    )
+    path.write_text(
+        text.replace("allow_push_on_error = false", "allow_push_on_error = true")
+    )
+    monkeypatch.setenv("AI_PUSH_HOOKS_ALLOW_PUSH_ON_ERROR", "false")
+    config, _ = load_config(repo)
+    assert config.general.allow_push_on_error is False
+
+
+@pytest.mark.parametrize("fail_sync", [True, False])
+def test_strict_hook_first_namespace_parent_is_durable(
+    tmp_path, monkeypatch, fail_sync
+):
+    import os
+    import json
+    from ai_push_hooks.hook import run_hook
+    from ai_push_hooks.executors.runners import ProcessResult
+    from ai_push_hooks.types import RequiredRetentionError
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    (repo / "ai-push-hooks.toml").write_text("""
+[logging]
+require_opencode_retention = true
+[workflow]
+modules = ["check"]
+[[modules.check.steps]]
+id = "query"
+type = "ask"
+prompt = "Return a response"
+output = "answer.txt"
+""")
+    git_dir = repo / ".git"
+    assert not (git_dir / "ai-push-hooks").exists()
+    identity = (git_dir.stat().st_dev, git_dir.stat().st_ino)
+    observed = []
+    calls = []
+    events = []
+    original = os.fsync
+
+    def sync(descriptor):
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == identity:
+            observed.append((git_dir / "ai-push-hooks").is_dir())
+            if fail_sync:
+                raise OSError("bootstrap parent fsync failed")
+        result = original(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == identity:
+            events.append("parent synced")
+        return result
+
+    def process(argv, **kwargs):
+        calls.append(argv[1])
+        events.append(argv[1])
+        payload = (
+            {
+                "type": "text",
+                "sessionID": "s1",
+                "part": {
+                    "type": "text",
+                    "sessionID": "s1",
+                    "messageID": "msg_1",
+                    "text": "answer",
+                },
+            }
+            if argv[1] == "run"
+            else {
+                "info": {"id": "s1"},
+                "messages": [
+                    {
+                        "id": "msg_1",
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": "answer"}],
+                    }
+                ],
+            }
+        )
+        raw = json.dumps(payload).encode() if argv[1] != "session" else b""
+        return ProcessResult(0, raw.decode(), "", stdout_bytes=raw)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    monkeypatch.setattr(
+        "ai_push_hooks.executors.runners.opencode.resolve_opencode_executable",
+        lambda: "/fixture/opencode",
+    )
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    if fail_sync:
+        with pytest.raises(RequiredRetentionError):
+            run_hook(cwd=repo, stdin_lines=[])
+        assert calls == []
+        assert (git_dir / "ai-push-hooks").is_dir()
+        # A separate user invocation must not trust the entry left by failed fsync.
+        with pytest.raises(RequiredRetentionError):
+            run_hook(cwd=repo, stdin_lines=[])
+        assert calls == []
+        assert events == []
+        # A third independent invocation succeeds only after the fault is removed.
+        fail_sync = False
+        assert run_hook(cwd=repo, stdin_lines=[]) == 0
+        assert calls == ["run", "export", "session"]
+    else:
+        assert run_hook(cwd=repo, stdin_lines=[]) == 0
+        assert calls == ["run", "export", "session"]
+    assert observed and all(observed)
+    assert events.index("parent synced") < events.index("run")
+
+
 def test_load_config_requires_config_file(tmp_path: pathlib.Path) -> None:
     with pytest.raises(
         HookError, match="Missing required config file `ai-push-hooks.toml`"

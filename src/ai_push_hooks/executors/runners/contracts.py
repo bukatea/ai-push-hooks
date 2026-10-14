@@ -18,7 +18,7 @@ from typing import Literal, Mapping, Protocol, Sequence
 RunnerMode = Literal["ask", "apply"]
 ProjectAccess = Literal["artifacts", "project"]
 PromptTransport = Literal["stdin", "argv"]
-SessionState = Literal["persisted", "ephemeral", "deleted"]
+SessionState = Literal["persisted", "ephemeral", "deleted", "unknown"]
 
 MAX_DIAGNOSTIC_CHARS = 4_000
 DIAGNOSTIC_TRUNCATION_MARKER = "[truncated]"
@@ -285,7 +285,7 @@ class SessionMetadata:
     def __post_init__(self) -> None:
         if self.session_id is not None:
             _validate_text(self.session_id, "session_id")
-        if self.state not in {"persisted", "ephemeral", "deleted"}:
+        if self.state not in {"persisted", "ephemeral", "deleted", "unknown"}:
             raise RunnerContractError("session state is invalid")
         if self.resumable and self.state != "persisted":
             raise RunnerContractError("only persisted sessions can be resumable")

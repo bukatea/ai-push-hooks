@@ -28,6 +28,10 @@ class HookError(RuntimeError):
     pass
 
 
+class RequiredRetentionError(HookError):
+    """Required OpenCode evidence failed; fail-open must not override this policy."""
+
+
 class PushSupersededError(HookError):
     """The in-flight push was invalidated by a commit this run created.
 
@@ -123,6 +127,7 @@ class LoggingConfig:
     jsonl: bool = True
     dir: str = ".git/ai-push-hooks/logs"
     capture_llm_transcript: bool = True
+    require_opencode_retention: bool = False
     transcript_dir: str = ".git/ai-push-hooks/transcripts"
     summary_dir: str = ".git/ai-push-hooks/summaries"
     print_llm_output: bool = False

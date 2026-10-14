@@ -38,14 +38,27 @@ from .types import (
     HookError,
     HookLogger,
     PushSupersededError,
+    RequiredRetentionError,
     RuntimeContext,
 )
+
+
+def _ensure_hook_namespace(git_dir: pathlib.Path, config: HookConfig) -> None:
+    required = config.logging.require_opencode_retention
+    try:
+        ensure_private_directory(git_dir / "ai-push-hooks", durable=required)
+    except (HookError, OSError) as exc:
+        if required:
+            raise RequiredRetentionError(
+                "Required OpenCode retention: hook namespace durability failed"
+            ) from exc
+        raise
 
 
 def _build_logger(
     repo_root: pathlib.Path, git_dir: pathlib.Path, config: HookConfig
 ) -> HookLogger:
-    ensure_private_directory(git_dir / "ai-push-hooks")
+    _ensure_hook_namespace(git_dir, config)
     jsonl_path = None
     if config.logging.jsonl:
         log_dir = ensure_dir(
@@ -93,7 +106,7 @@ def _run_hook_impl(
     repo_root = resolve_repo_root(current_dir)
     git_dir = resolve_git_dir(repo_root)
     config, _config_path = load_config(repo_root)
-    ensure_private_directory(git_dir / "ai-push-hooks")
+    _ensure_hook_namespace(git_dir, config)
     logger = _build_logger(repo_root, git_dir, config)
 
     if not config.general.enabled:
@@ -261,7 +274,7 @@ def _run_hook_impl(
             run_dir=str(workflow_result.run_dir),
         )
         return 0
-    except PushSupersededError:
+    except (PushSupersededError, RequiredRetentionError):
         raise
     except Exception as exc:  # noqa: BLE001
         message = str(exc).strip() or exc.__class__.__name__
@@ -286,7 +299,7 @@ def run_hook(
         return 0
     try:
         return _run_hook_impl(remote_name, remote_url, stdin_lines, cwd)
-    except PushSupersededError:
+    except (PushSupersededError, RequiredRetentionError):
         # Not a failed check, so fail-open does not apply: this run committed a
         # fix locally, which means the commits Git is holding for this push are
         # stale. Allowing it through would push the unfixed code and report

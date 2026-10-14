@@ -52,6 +52,562 @@ def _request(
     return RunnerRequest(**values)
 
 
+def test_required_retention_rejects_unidentified_output(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    # Set the proposed flag without requiring the new dataclass field for RED.
+    object.__setattr__(config.logging, "require_opencode_retention", True)
+    context = build_context(repo, config)
+    context.opencode_executable = "/fixture/opencode"
+    raw = b'{"type":"text","part":{"text":"[]"}}\n'
+    monkeypatch.setattr(
+        "ai_push_hooks.executors.runners.opencode.run_process",
+        lambda *args, **kwargs: ProcessResult(0, raw.decode(), "", stdout_bytes=raw),
+    )
+    with pytest.raises(HookError, match="retention"):
+        OpenCodeRunner().run(_request(context))
+
+
+def _strict_fixture(tmp_path):
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    config = replace(
+        config, logging=replace(config.logging, require_opencode_retention=True)
+    )
+    context = build_context(repo, config)
+    context.opencode_executable = "/fixture/opencode"
+    event = {
+        "type": "text",
+        "timestamp": 1,
+        "sessionID": "s1",
+        "part": {"type": "text", "sessionID": "s1", "messageID": "msg_1", "text": "[]"},
+    }
+    export = {
+        "info": {"id": "s1"},
+        "messages": [
+            {
+                "type": "assistant",
+                "id": "msg_1",
+                "content": [{"type": "text", "text": "prefix []"}],
+            }
+        ],
+    }
+    return context, event, export
+
+
+def _bytes_result(raw, code=0, **kwargs):
+    return ProcessResult(
+        code, raw.decode("utf-8", "surrogateescape"), "", stdout_bytes=raw, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "export_nonzero",
+        "export_empty",
+        "export_list",
+        "export_identity",
+        "export_correlation",
+        "export_error",
+        "delete_nonzero",
+        "delete_timeout",
+        "no_delete",
+    ],
+)
+def test_required_lifecycle_exact_bytes_and_no_unsafe_deletion(
+    tmp_path, monkeypatch, failure
+):
+    context, event, export = _strict_fixture(tmp_path)
+    if failure == "no_delete":
+        context.config = replace(
+            context.config,
+            llm=replace(context.config.llm, delete_session_after_run=False),
+        )
+    raw = ("  " + json.dumps(event) + "\n\n").encode()
+    if failure == "export_identity":
+        export["info"]["id"] = "other"
+    if failure == "export_correlation":
+        export["messages"][0]["id"] = "msg_other"
+    if failure == "export_error":
+        export["error"] = {"private": "body"}
+    exported = ("\n" + json.dumps(export, indent=2) + "\n").encode()
+    if failure == "export_empty":
+        exported = b""
+    if failure == "export_list":
+        exported = b"[]"
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[1] == "run":
+            return _bytes_result(raw)
+        if argv[1] == "export":
+            return _bytes_result(exported, 1 if failure == "export_nonzero" else 0)
+        if failure == "delete_timeout":
+            raise RunnerTimeoutError("timeout")
+        return _bytes_result(b"", 1 if failure == "delete_nonzero" else 0)
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(context)
+    result = runner.run(request)
+    if failure not in {None, "no_delete"}:
+        with pytest.raises(HookError, match="retention"):
+            runner.finalize(request, result)
+    else:
+        result = runner.finalize(request, result)
+        assert result.session.state == ("persisted" if failure else "deleted")
+    directory = runner._retention_dir
+    assert (directory / "run.stdout").read_bytes() == raw
+    assert (directory / "export.stdout").read_bytes() == exported
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in directory.iterdir())
+    assert len(calls) == (
+        2 if failure and (failure.startswith("export") or failure == "no_delete") else 3
+    )
+    assert all(call[0][0] == "/fixture/opencode" for call in calls)
+    assert len({call[1]["env"]["XDG_DATA_HOME"] for call in calls}) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "conflict",
+        "part_conflict",
+        "missing_message",
+        "step_only",
+        "malformed",
+        "error",
+        "invalid_bytes",
+        "truncated",
+        "nonzero",
+        "resume",
+    ],
+)
+def test_required_run_failure_keeps_bytes_and_never_deletes(
+    tmp_path, monkeypatch, failure
+):
+    context, event, _ = _strict_fixture(tmp_path)
+    if failure == "part_conflict":
+        event["part"]["sessionID"] = "other"
+    if failure == "missing_message":
+        del event["part"]["messageID"]
+    if failure == "step_only":
+        event["type"] = "step_finish"
+        event["part"]["type"] = "step-finish"
+    if failure == "error":
+        event["part"]["error"] = {"private": "body"}
+    raw = (json.dumps(event) + "\n").encode()
+    if failure == "conflict":
+        event["sessionID"] = "other"
+        raw += json.dumps(event).encode()
+    if failure == "malformed":
+        raw += b"{"
+    if failure == "invalid_bytes":
+        raw += b"\xff"
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        return _bytes_result(
+            raw,
+            1 if failure == "nonzero" else 0,
+            stdout_truncated=failure == "truncated",
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(
+        context,
+        resume_session=failure == "resume",
+        session_id="other" if failure == "resume" else None,
+    )
+    with pytest.raises(HookError, match="retention"):
+        runner.run(request)
+    with pytest.raises(HookError, match="retention"):
+        runner.finalize(request, RunnerResult("", 1, "", ""))
+    assert len(calls) == 1
+    assert (runner._retention_dir / "run.stdout").read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    "write_failure", ["run.stdout", "export.stdout", "intent", "completion"]
+)
+def test_required_storage_failure_blocks_success_without_retry(
+    tmp_path, monkeypatch, write_failure
+):
+    from ai_push_hooks.executors.runners import opencode as module
+
+    context, event, export = _strict_fixture(tmp_path)
+    original = module.atomic_write_bytes
+    calls = []
+
+    def write(path, content, **kwargs):
+        receipt = json.loads(content) if path.name == "receipt.json" else {}
+        if (
+            path.name == write_failure
+            or (write_failure == "intent" and receipt.get("delete_action") == "intent")
+            or (write_failure == "completion" and receipt.get("outcome") == "deleted")
+        ):
+            raise OSError("fixture write failure")
+        original(path, content, **kwargs)
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        return _bytes_result(
+            json.dumps(event if argv[1] == "run" else export).encode()
+            if argv[1] != "session"
+            else b""
+        )
+
+    monkeypatch.setattr(module, "atomic_write_bytes", write)
+    monkeypatch.setattr(module, "run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(context)
+    with pytest.raises(HookError, match="retention"):
+        result = runner.run(request)
+        runner.finalize(request, result)
+    assert (
+        len(calls)
+        == {"run.stdout": 1, "export.stdout": 2, "intent": 2, "completion": 3}[
+            write_failure
+        ]
+    )
+    if write_failure == "completion":
+        assert (
+            json.loads((runner._retention_dir / "receipt.json").read_bytes())["outcome"]
+            == "unknown"
+        )
+
+
+@pytest.mark.parametrize("mode", ["ask", "apply"])
+def test_required_real_workflow_finalization_failure_no_model_retry(
+    tmp_path, monkeypatch, mode
+):
+    from ai_push_hooks.executors.runner_workflow import run_runner_once
+    from ai_push_hooks.types import RequiredRetentionError, StepConfig, RunnerProfile
+
+    context, event, _ = _strict_fixture(tmp_path)
+    context.config = replace(
+        context.config,
+        runners={"native": RunnerProfile(type="opencode", name="native")},
+    )
+    stage = tmp_path / "isolated-stage"
+    stage.mkdir()
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        return _bytes_result(json.dumps(event).encode() if argv[1] == "run" else b"{}")
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    with pytest.raises(RequiredRetentionError):
+        run_runner_once(
+            context,
+            StepConfig(
+                id="strict", type=mode, runner="native", allow_paths=("README.md",)
+            ),
+            "instruction",
+            [],
+            "docs.strict",
+            working_directory=stage if mode == "apply" else context.repo_root,
+        )
+    assert [argv[1] for argv in calls] == ["run", "export"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "stdout",
+        "stderr",
+        "encoding",
+        "bytes",
+        "nonzero",
+        "timeout",
+        "attempted_receipt",
+    ],
+)
+def test_strict_delete_ambiguous_outcome(tmp_path, monkeypatch, failure):
+    from ai_push_hooks.executors.runners import opencode as module
+    from ai_push_hooks.types import RequiredRetentionError
+
+    context, event, export = _strict_fixture(tmp_path)
+    calls = []
+    original = module.atomic_write_bytes
+
+    def write(path, content, **kwargs):
+        if (
+            failure == "attempted_receipt"
+            and path.name == "receipt.json"
+            and json.loads(content).get("delete_action") == "attempted"
+        ):
+            raise OSError("attempt receipt unavailable")
+        return original(path, content, **kwargs)
+
+    def process(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] != "session":
+            return _bytes_result(
+                json.dumps(event if argv[1] == "run" else export).encode()
+            )
+        if failure == "timeout":
+            raise RunnerTimeoutError("fixture timeout")
+        if failure == "bytes":
+            return ProcessResult(0, "not captured", "")
+        return _bytes_result(
+            b"\xff" if failure == "encoding" else b"",
+            1 if failure == "nonzero" else 0,
+            stdout_truncated=failure == "stdout",
+            stderr_truncated=failure == "stderr",
+        )
+
+    monkeypatch.setattr(module, "atomic_write_bytes", write)
+    monkeypatch.setattr(module, "run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(context)
+    result = runner.run(request)
+    with pytest.raises(RequiredRetentionError):
+        runner.finalize(request, result)
+    assert calls == (
+        ["run", "export"]
+        if failure == "attempted_receipt"
+        else ["run", "export", "session"]
+    )
+    if failure != "attempted_receipt":
+        assert (
+            json.loads((runner._retention_dir / "receipt.json").read_bytes())["outcome"]
+            == "unknown"
+        )
+
+
+def test_atomic_writer_ancestor_replacement_never_writes_outside(tmp_path, monkeypatch):
+    import os
+    from ai_push_hooks.paths import atomic_write_bytes
+
+    root = tmp_path / "owned"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = os.open
+    switched = False
+
+    def open_with_race(*args, **kwargs):
+        nonlocal switched
+        if not switched and pathlib.Path(args[0]).name.startswith(".ai-push-hooks-"):
+            switched = True
+            root.rename(tmp_path / "moved")
+            root.symlink_to(outside, target_is_directory=True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_with_race)
+    with pytest.raises((HookError, OSError)):
+        atomic_write_bytes(root / "receipt.json", b"private")
+    assert list(outside.iterdir()) == []
+
+
+def test_strict_invocation_parent_durability_failure_prevents_model(
+    tmp_path, monkeypatch
+):
+    import os
+    from ai_push_hooks.executors.runners import opencode as module
+
+    context, _, _ = _strict_fixture(tmp_path)
+    transcript_root = context.git_dir / "ai-push-hooks" / "transcripts"
+    transcript_root.mkdir(parents=True, exist_ok=True)
+    root_identity = (transcript_root.stat().st_dev, transcript_root.stat().st_ino)
+    calls = []
+    monkeypatch.setattr(
+        module, "run_process", lambda *args, **kwargs: calls.append(args)
+    )
+    original = os.fsync
+    root_syncs = 0
+
+    def fsync(descriptor):
+        nonlocal root_syncs
+        import stat
+
+        metadata = os.fstat(descriptor)
+        if (
+            stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == root_identity
+        ):
+            root_syncs += 1
+            if root_syncs == 2:
+                raise OSError("invocation parent durability failure")
+        return original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(HookError, match="retention"):
+        OpenCodeRunner().run(_request(context))
+    assert calls == []
+    assert root_syncs == 2
+
+
+@pytest.mark.parametrize("kind", ["symlink", "nonregular", "foreign"])
+def test_atomic_writer_rejects_unsafe_targets(tmp_path, monkeypatch, kind):
+    import os
+    from types import SimpleNamespace
+    from ai_push_hooks.paths import atomic_write_bytes
+
+    target = tmp_path / "evidence"
+    if kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"unchanged")
+        target.symlink_to(outside)
+    elif kind == "nonregular":
+        target.mkdir()
+    else:
+        original = os.fstat
+
+        def foreign(descriptor):
+            metadata = original(descriptor)
+            return SimpleNamespace(
+                st_uid=os.geteuid() + 10000,
+                st_mode=metadata.st_mode,
+                st_dev=metadata.st_dev,
+                st_ino=metadata.st_ino,
+            )
+
+        monkeypatch.setattr(os, "fstat", foreign)
+    with pytest.raises(HookError):
+        atomic_write_bytes(target, b"private")
+    if kind == "symlink":
+        assert outside.read_bytes() == b"unchanged"
+
+
+@pytest.mark.parametrize("resume", [True, False])
+def test_strict_invocation_collision_preserves_prior_evidence(
+    tmp_path, monkeypatch, resume
+):
+    from types import SimpleNamespace
+    from ai_push_hooks.executors.runners import opencode as module
+
+    context, event, _ = _strict_fixture(tmp_path)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        return _bytes_result(json.dumps(event).encode())
+
+    monkeypatch.setattr(module.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed"))
+    monkeypatch.setattr(module, "run_process", process)
+    first = OpenCodeRunner()
+    first.run(_request(context, stage="docs/a"))
+    directory = first._retention_dir
+    sentinel = {path.name: path.read_bytes() for path in directory.iterdir()}
+    with pytest.raises(HookError, match="retention"):
+        OpenCodeRunner().run(
+            _request(
+                context,
+                stage="docs:a",
+                resume_session=resume,
+                session_id="s1" if resume else None,
+            )
+        )
+    assert len(calls) == 1
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == sentinel
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in directory.iterdir())
+
+
+@pytest.mark.parametrize("action", ["run", "export", "delete"])
+@pytest.mark.parametrize("kind", ["timeout", "signal"])
+def test_strict_failed_process_preserves_original_prefixes(
+    tmp_path, monkeypatch, action, kind
+):
+    from ai_push_hooks.executors.runners import RunnerSignalError
+
+    context, event, export = _strict_fixture(tmp_path)
+    stdout = b'  {"sessionID":"s1","partial":\xff\n'
+    stderr = b"private stderr prefix\x00\xff\n"
+    failed = ProcessResult(
+        -9,
+        stdout.decode("utf-8", "surrogateescape"),
+        stderr.decode("utf-8", "surrogateescape"),
+        stdout_truncated=True,
+        stderr_truncated=False,
+        stdout_bytes=stdout,
+        stderr_bytes=stderr,
+    )
+    primary = (RunnerTimeoutError if kind == "timeout" else RunnerSignalError)(
+        "fixture failure"
+    )
+    primary._process_result = failed
+    calls = []
+
+    def process(argv, **kwargs):
+        boundary = "delete" if argv[1] == "session" else argv[1]
+        calls.append(boundary)
+        if boundary == action:
+            raise primary
+        return _bytes_result(
+            json.dumps(event if boundary == "run" else export).encode()
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(context)
+    with pytest.raises(HookError, match="retention"):
+        result = runner.run(request)
+        runner.finalize(request, result)
+    directory = runner._retention_dir
+    assert (directory / f"{action}.stdout").read_bytes() == stdout
+    assert (directory / f"{action}.stderr").read_bytes() == stderr
+    receipt = json.loads((directory / "receipt.json").read_bytes())
+    assert receipt[action] == {
+        "available": True,
+        "exception": type(primary).__name__,
+        "returncode": -9,
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
+        "stdout_truncated": True,
+        "stderr_truncated": False,
+    }
+    assert receipt["outcome"] == ("retained" if action == "export" else "unknown")
+    assert (
+        calls
+        == {
+            "run": ["run"],
+            "export": ["run", "export"],
+            "delete": ["run", "export", "delete"],
+        }[action]
+    )
+
+
+def test_strict_process_and_capture_failure_preserves_both_causes(
+    tmp_path, monkeypatch
+):
+    from ai_push_hooks.executors.runners import opencode as module
+
+    context, _, _ = _strict_fixture(tmp_path)
+    primary = RunnerTimeoutError("fixture timeout")
+    primary._process_result = ProcessResult(
+        -9, "prefix", "stderr", stdout_bytes=b"prefix", stderr_bytes=b"stderr"
+    )
+    secondary = OSError("fixture capture failure")
+    original = module.atomic_write_bytes
+    calls = []
+
+    def process(*args, **kwargs):
+        calls.append(args)
+        raise primary
+
+    def write(path, content, **kwargs):
+        if path.name == "run.stdout":
+            raise secondary
+        return original(path, content, **kwargs)
+
+    monkeypatch.setattr(module, "run_process", process)
+    monkeypatch.setattr(module, "atomic_write_bytes", write)
+    with pytest.raises(HookError) as caught:
+        OpenCodeRunner().run(_request(context))
+    assert caught.value.__cause__ is primary
+    assert caught.value.secondary_error is secondary
+    assert len(calls) == 1
+
+
 def test_create_runner_exposes_resume_finalize_and_transcript_capabilities() -> None:
     runner = create_runner()
 

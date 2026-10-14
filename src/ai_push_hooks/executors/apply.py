@@ -21,7 +21,13 @@ from ..paths import (
     sanitize_file_mode,
 )
 from ..config import COMMIT_SUBJECT_MAX_CHARS
-from ..types import HookError, ModuleRuntimeState, RuntimeContext, StepConfig
+from ..types import (
+    HookError,
+    RequiredRetentionError,
+    ModuleRuntimeState,
+    RuntimeContext,
+    StepConfig,
+)
 from .autocommit import register_pending_auto_commit
 from ..git_utils import (
     list_repo_changes,
@@ -983,7 +989,12 @@ def run_apply_step(
             metadata_before,
         )
         if call_error is not None:
-            raise HookError(
+            error_type = (
+                RequiredRetentionError
+                if isinstance(call_error, RequiredRetentionError)
+                else HookError
+            )
+            raise error_type(
                 f"Apply step failed in isolated staging: {call_error}"
             ) from call_error
         if result is None:

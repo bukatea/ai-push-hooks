@@ -121,6 +121,18 @@ def run_ask_step(
     except Exception as exc:  # noqa: BLE001
         raise _named_error(selected_profile, "unknown", stage_name, exc) from exc
     retained_invocation = None
+    if (
+        profile.type == "opencode"
+        and context.config.logging.require_opencode_retention
+        and wants_json
+        and context.config.llm.json_max_retries > 0
+        and not context.config.llm.json_retry_new_session
+    ):
+        from ..types import RequiredRetentionError
+
+        raise RequiredRetentionError(
+            "Required OpenCode retention: JSON repair requires json_retry_new_session=true"
+        )
 
     # Artifact-only analysis must retain its historical empty scratch cwd;
     # project-aware analysis gets the actual checkout root so the adapter can
