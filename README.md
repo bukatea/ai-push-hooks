@@ -139,6 +139,7 @@ If installed as a local npm/pnpm dependency, run commands with `npx` or `pnpm ex
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `runner` | string | `"opencode"` | LLM runner label (currently OpenCode flow). |
+| `opencode_cli_generation` | string | `"legacy"` | Explicit CLI syntax: `"legacy"` or opt-in `"v2"` (OpenCode 2.0.25 target). Other values/types are rejected. |
 | `model` | string | `"openai/gpt-5.5"` | Model passed to OpenCode. |
 | `variant` | string | `""` | Optional OpenCode variant. |
 | `timeout_seconds` | int | `800` | Timeout per LLM invocation and related OpenCode calls. |
@@ -149,6 +150,39 @@ If installed as a local npm/pnpm dependency, run commands with `npx` or `pnpm ex
 | `delete_session_after_run` | bool | `true` | Deletes OpenCode sessions after completion. |
 | `max_diff_bytes` | int | `180000` | Max bytes of git diff sent into workflow artifacts. |
 | `session_title_prefix` | string | `"ai-push-hooks"` | Prefix for OpenCode session titles. |
+
+#### Opt-in OpenCode V2 CLI syntax (source proposal)
+
+This compatibility/backport proposal is based on public v0.1.19 source, not a
+maintainer-approved release or a patch qualified for current upstream main.
+The published v0.1.19 installation does not have this setting. Release acceptance
+and consuming-project adoption require separate review and validation.
+
+```toml
+[llm]
+opencode_cli_generation = "v2"
+variant = ""
+```
+
+Omitting the field (or explicitly selecting `"legacy"`) preserves the original
+argv unchanged. The explicit `"v2"` syntax targets the
+[OpenCode 2.0.25 CLI](https://github.com/anomalyco/opencode/tree/v2.0.25/packages/cli):
+`run` adds `--standalone`, export uses `session export --standalone <session-id>`,
+and deletion uses `session delete --standalone <session-id>`. Each related call
+selects the documented private-server mode instead of managed shared-server
+discovery; this adapter does not change persistent shared-server configuration.
+It neither detects the installed version nor accepts a server URL/extra argv.
+
+A nonempty `variant` with `"v2"` is rejected before launch, including a nonempty
+`AI_PUSH_HOOKS_VARIANT` override. V2 model/variant migration is not implemented;
+model selection, prompts, attachments, retry/session behavior and existing
+environment handling otherwise remain unchanged. There is no generation env
+override. Transcript/export/deletion failure policy is unchanged too.
+
+Fake-process source unit tests establish configuration and argv behavior only.
+They do **not** establish installed-native capture/export/delete acceptance,
+permission/plugin/config isolation, resource cleanup, or a genuine push-hook
+pass. Those require separately authorized release/adoption qualification.
 
 ### `[logging]`
 

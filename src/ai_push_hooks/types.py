@@ -39,6 +39,16 @@ class LlmConfig:
     delete_session_after_run: bool = True
     max_diff_bytes: int = 180000
     session_title_prefix: str = "ai-push-hooks"
+    opencode_cli_generation: str = "legacy"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.opencode_cli_generation, str) or self.opencode_cli_generation not in (
+            "legacy",
+            "v2",
+        ):
+            raise HookError("llm.opencode_cli_generation must be 'legacy' or 'v2'")
+        if self.opencode_cli_generation == "v2" and self.variant:
+            raise HookError("llm.variant must be empty for opencode_cli_generation 'v2'")
 
 
 @dataclass(frozen=True)

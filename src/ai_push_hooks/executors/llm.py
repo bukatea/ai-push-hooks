@@ -130,13 +130,22 @@ def _transcript_dir(context: RuntimeContext) -> pathlib.Path | None:
     )
 
 
+def _opencode_session_command(context: RuntimeContext, action: str, session_id: str) -> list[str]:
+    executable = context.opencode_executable or resolve_opencode_executable()
+    if context.config.llm.opencode_cli_generation == "v2":
+        return [executable, "session", action, "--standalone", session_id]
+    if action == "export":
+        return [executable, "export", session_id]
+    return [executable, "session", action, session_id]
+
+
 def export_opencode_session_json(
     context: RuntimeContext,
     session_id: str,
     export_path: pathlib.Path,
 ) -> bool:
     completed = run_command(
-        [context.opencode_executable or resolve_opencode_executable(), "export", session_id],
+        _opencode_session_command(context, "export", session_id),
         cwd=context.repo_root,
         timeout=context.config.llm.timeout_seconds,
         check=False,
@@ -152,7 +161,7 @@ def export_opencode_session_json(
 
 def delete_opencode_session(context: RuntimeContext, session_id: str) -> None:
     run_command(
-        [context.opencode_executable or resolve_opencode_executable(), "session", "delete", session_id],
+        _opencode_session_command(context, "delete", session_id),
         cwd=context.repo_root,
         timeout=context.config.llm.timeout_seconds,
         check=False,
@@ -194,6 +203,8 @@ def call_opencode(
         "--model",
         context.config.llm.model,
     ]
+    if context.config.llm.opencode_cli_generation == "v2":
+        cmd.append("--standalone")
     if context.config.llm.variant:
         cmd.extend(["--variant", context.config.llm.variant])
     if existing_session_id:
