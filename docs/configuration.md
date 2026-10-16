@@ -76,7 +76,7 @@ OpenCode, Codex, and Claude are first-class adapters. The generic `command` type
 | `type` | Required: `opencode`, `codex`, `claude`, or `command`. |
 | `model` | Runner-specific model identifier. |
 | `project_access` | `artifacts` or `project`; OpenCode defaults to `artifacts`, others to `project`. |
-| `variant` | Optional OpenCode variant. |
+| `variant` | Optional legacy OpenCode variant; nonempty values are rejected for the V2 CLI seam. |
 | `command` | Required argv array for command runners. |
 | `prompt_transport` | Command runners: `stdin` (default) or `argv`. |
 
@@ -84,9 +84,64 @@ Without an explicit OpenCode profile, `[llm].model` and `[llm].variant` configur
 
 Artifact mode supplies collected inputs in a scratch directory. Project mode lets analysis inspect the checkout. Apply always uses a temporary staging copy, with propagation limited by `allow_paths`.
 
-OpenCode runs with isolated configuration and permissions; project/global configuration, external plugins, and MCP servers are not loaded. Codex uses read-only analysis and workspace-write apply modes. Claude Code uses separate analysis and editing permissions. Authenticate the CLI before using it in a hook.
+The default legacy OpenCode generation runs with isolated configuration and permissions; project/global configuration, external plugins, and MCP servers are not loaded. This claim does **not** extend to the partial V2 CLI seam below. Codex uses read-only analysis and workspace-write apply modes. Claude Code uses separate analysis and editing permissions. Authenticate the CLI before using it in a hook.
 
 Apply requires a single pushed branch whose local commit is the checked-out `HEAD`. Staging excludes Git metadata, `AGENTS.md`, ignored files, symlinks, and special files. These controls are not an OS sandbox or an automatic rollback system. See [Security](../SECURITY.md).
+
+### OpenCode CLI generation (partial source-only)
+
+`[llm].opencode_cli_generation` accepts exactly `"legacy"` (default) or `"v2"`.
+It is global for every `type = "opencode"` profile, including implicit, explicit
+and per-step selections. There is no per-profile selector, environment override,
+version autodetection, probe, server fallback or generic extra-argv setting.
+Other runner types are unchanged. For source evaluation only:
+
+```toml
+[llm]
+opencode_cli_generation = "v2"
+```
+
+**This is a partial source-only CLI-generation candidate targeting OpenCode
+2.0.25, not production-supported V2 or a security qualification.** Its
+`--standalone` selects CLI-owned standalone connection handling; it is **not**
+equivalent to legacy `--pure`. Stored well-known configuration can still load
+plugins in V2. Inherited isolated HOME/config/cache/state, filtered provider
+environment, project-disable flags and inline `plugin: []`/permission payloads
+do not establish removal of that gap. Shared provider data/session storage is
+retained unchanged; effective V2 config/plugin exclusion, permission enforcement
+and native run/export/delete behavior remain unqualified. See [Security](../SECURITY.md).
+
+Unknown selector strings, whitespace/case variants and non-string values fail
+validation. V2 rejects nonempty separate `variant` values from `[llm]`, any
+OpenCode profile (even unselected), final `AI_PUSH_HOOKS_VARIANT` overrides and
+direct adapter requests, including finalize-only requests, before launching a
+child. Empty variants are accepted. Models are passed verbatim; there is no
+model/variant rewriting. `AI_PUSH_HOOKS_MODEL` still overrides the effective
+selected profile's model. More than 100 V2 attachments are rejected before
+materialization or launch; legacy attachment behavior is unchanged.
+
+The exact V2 argv order is (brackets below denote optional groups, not literal
+arguments):
+
+```text
+opencode run --agent AGENT --standalone --format json [--model MODEL] (--session SID | --title TITLE) [--file PATH ...] -- PROMPT
+opencode session export --standalone SID
+opencode session delete --standalone SID
+```
+
+Each attachment uses its own `--file PATH` pair, in input order. Fresh calls get
+a title; resumed calls keep the exact session ID. There is exactly one
+`--standalone` per call, no `--pure`, `--variant`, server URL or permission-skip
+flag. The unchanged legacy vectors use `run --agent AGENT --pure --format json`,
+optional model/variant, session-or-title, file pairs and `-- PROMPT`;
+`export SID --pure`; and `session delete SID --pure`.
+Source syntax evidence is the tagged
+[v2.0.25 command definitions](https://github.com/anomalyco/opencode/blob/v2.0.25/packages/cli/src/commands/commands.ts)
+and [connection selector](https://github.com/anomalyco/opencode/blob/v2.0.25/packages/cli/src/services/server-connection.ts).
+Fake-process source tests establish emitted argv and host staging/environment
+policy only, not V2 parser, permission engine, plugin loader, provider or native
+lifecycle acceptance. Existing transcript/deletion toggles and best-effort
+failure behavior remain unchanged; this setting is not adoption/release approval.
 
 ### Live validation snapshot
 
@@ -406,6 +461,7 @@ These optional settings supplement the workflow and runner definitions:
 | `general` | `skip_on_sync_branch` | `true` |
 | `general` | `base_branch` | `"main"` |
 | `llm` | `runner` | `"opencode"` |
+| `llm` | `opencode_cli_generation` | `"legacy"`; `"v2"` is a partial source-only CLI seam, not qualified V2 isolation |
 | `llm` | `model` | `"openai/gpt-5.6-luna"` (implicit OpenCode profile) |
 | `llm` | `variant` | `""` |
 | `llm` | `timeout_seconds` | `800` |
@@ -436,7 +492,7 @@ Model availability depends on the provider. Select one available to your account
 | `AI_PUSH_HOOKS_ALLOW_DIRTY=1` | Allow a dirty worktree. |
 | `AI_PUSH_HOOKS_BASE_BRANCH` | Override the base branch. |
 | `AI_PUSH_HOOKS_MODEL` | Override the selected runner's model. |
-| `AI_PUSH_HOOKS_VARIANT` | Override the OpenCode variant. |
+| `AI_PUSH_HOOKS_VARIANT` | Override the legacy OpenCode variant; nonempty values are rejected for V2. |
 | `AI_PUSH_HOOKS_TIMEOUT_SECONDS` | Override the runner timeout. |
 | `AI_PUSH_HOOKS_LOG_LEVEL` | Set console verbosity. |
 | `AI_PUSH_HOOKS_PRINT_LLM_OUTPUT=1` | Print normalized, redacted final responses; sensitive opt-in. |

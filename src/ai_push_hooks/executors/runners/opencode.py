@@ -240,7 +240,9 @@ class OpenCodeRunner:
             "run",
             "--agent",
             agent,
-            "--pure",
+            "--standalone"
+            if self._cli_generation(request, context) == "v2"
+            else "--pure",
             "--format",
             "json",
         ]
@@ -290,12 +292,35 @@ class OpenCodeRunner:
                 "OpenCode apply requests require a non-VCS isolated staging directory"
             )
 
+    @staticmethod
+    def _cli_generation(request: RunnerRequest, context: Any) -> str:
+        """Validate before any executable, attachment or best-effort lifecycle work.
+
+        This selector changes CLI syntax only, not the inherited host policy or
+        qualification of the selected OpenCode version's isolation guarantees.
+        """
+        llm = getattr(getattr(context, "config", None), "llm", None)
+        generation = getattr(llm, "opencode_cli_generation", "legacy")
+        if not isinstance(generation, str) or generation not in ("legacy", "v2"):
+            raise RunnerContractError("OpenCode CLI generation must be legacy or v2")
+        if generation == "v2":
+            if request.variant:
+                raise RunnerContractError(
+                    "OpenCode v2 does not support a separate variant option"
+                )
+            if len(request.artifacts) > 100:
+                raise RunnerContractError(
+                    "OpenCode v2 supports at most 100 attachments"
+                )
+        return generation
+
     def run(self, request: RunnerRequest) -> RunnerResult:
         if request.runner_type != "opencode":
             raise RunnerContractError(
                 f"OpenCode runner cannot handle runner type {request.runner_type!r}"
             )
         context = self._context(request)
+        self._cli_generation(request, context)
         if request.mode == "apply" and not request.allow_paths:
             raise RunnerContractError("OpenCode apply requests require allow_paths")
         if request.mode == "apply" and request.project_access == "artifacts":
@@ -448,9 +473,16 @@ class OpenCodeRunner:
         self,
         request: RunnerRequest,
         context: Any,
-        argv: list[str],
+        executable: str,
+        session_id: str,
         action: str,
     ) -> Any:
+        if self._cli_generation(request, context) == "v2":
+            argv = [executable, "session", action, "--standalone", session_id]
+        elif action == "export":
+            argv = [executable, "export", session_id, "--pure"]
+        else:
+            argv = [executable, "session", "delete", session_id, "--pure"]
         # Export/delete must use the original stage isolation root.  Using a
         # different action-specific root makes retained sessions invisible to
         # OpenCode because its HOME/XDG state is isolated per stage.
@@ -470,6 +502,7 @@ class OpenCodeRunner:
             )
 
     def finalize(self, request: RunnerRequest, result: RunnerResult) -> RunnerResult:
+        self._cli_generation(request, request.integration_context)
         session = result.session
         if session is None or not session.session_id:
             return result
@@ -497,7 +530,8 @@ class OpenCodeRunner:
                     exported = self._lifecycle_process(
                         request,
                         context,
-                        [executable, "export", session_id, "--pure"],
+                        executable,
+                        session_id,
                         "export",
                     )
                     if (
@@ -531,7 +565,8 @@ class OpenCodeRunner:
                 deleted_result = self._lifecycle_process(
                     request,
                     context,
-                    [executable, "session", "delete", session_id, "--pure"],
+                    executable,
+                    session_id,
                     "delete",
                 )
                 deleted = deleted_result.returncode == 0

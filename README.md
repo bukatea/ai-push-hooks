@@ -129,6 +129,21 @@ type = "claude"
 
 Each `ask` or `apply` step can override the runner, so one tool can review and another can fix. **Any other agentic CLI, including Pi, can integrate through a [custom command runner](docs/configuration.md#custom-runners)**: supply a noninteractive command or a thin wrapper. Use model identifiers available to your provider.
 
+For **source evaluation only**, the partial OpenCode V2 CLI-generation candidate
+targets `2.0.25` with this global opt-in (the default remains `"legacy"`):
+
+```toml
+[llm]
+opencode_cli_generation = "v2"
+```
+
+This selects `--standalone`, **not `--pure` equivalence or production-supported
+V2**. V2's stored well-known configuration/plugin-loading gap remains unresolved;
+the inherited environment and inline config payloads do not remove it. V2
+permission/plugin isolation and native lifecycle behavior are not qualified.
+See [scope, syntax and restrictions](docs/configuration.md#opencode-cli-generation-partial-source-only)
+and [Security](SECURITY.md). Existing examples continue to use legacy behavior.
+
 ## Control And Safety
 
 - Errors block pushes by default. AI judgments can still miss violations or report false positives.

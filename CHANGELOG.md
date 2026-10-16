@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Added
 
+- Added an opt-in global `llm.opencode_cli_generation = "v2"` **partial
+  source-only CLI-generation candidate** targeting OpenCode 2.0.25: standalone
+  run/resume/session export/delete argv, strict selector/variant validation and
+  a 100-attachment V2 limit. Default legacy argv and host policies are unchanged.
+  This is not production-supported V2, effective `--pure`/permission/plugin
+  equivalence, native qualification, adoption or release approval. V2's stored
+  well-known configuration/plugin-loading gap remains unresolved; inherited
+  environment and inline config payloads do not remove it. Source fake-process
+  tests do not establish native isolation or lifecycle acceptance.
 - Added `auto_commit` to `apply` steps, committing the edits a fix propagated.
   Off by default. The commit is made after every later step passes, so tests and
   assert gates can still reject the edits; a failure leaves them uncommitted in

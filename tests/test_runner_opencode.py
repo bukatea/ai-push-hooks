@@ -362,11 +362,15 @@ def test_timeout_preserves_session_for_lifecycle_cleanup_and_attachment_cleanup(
     ]
 
 
+@pytest.mark.parametrize("generation", ["legacy", "v2"])
 def test_successful_run_blocks_on_attachment_cleanup_failure_without_raw_details(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, generation: str
 ) -> None:
     repo = init_repo(tmp_path, branch="feature/docs")
     config, _ = load_config(repo)
+    config = replace(
+        config, llm=replace(config.llm, opencode_cli_generation=generation)
+    )
     context = build_context(repo, config)
     context.opencode_executable = "/usr/local/bin/opencode"
 
@@ -394,7 +398,9 @@ def test_successful_run_blocks_on_attachment_cleanup_failure_without_raw_details
     )
 
     with pytest.raises(RunnerError) as error:
-        OpenCodeRunner().run(_request(context))
+        OpenCodeRunner().run(
+            _request(context, variant="" if generation == "v2" else "profile-variant")
+        )
 
     assert getattr(error.value, "session_id", None) == "cleanup-session"
     assert "cleanup-secret" not in str(error.value)
@@ -402,11 +408,15 @@ def test_successful_run_blocks_on_attachment_cleanup_failure_without_raw_details
     assert "cleanup-secret" not in repr(error.value)
 
 
+@pytest.mark.parametrize("generation", ["legacy", "v2"])
 def test_invocation_error_survives_attachment_cleanup_failure_with_session_identity(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, generation: str
 ) -> None:
     repo = init_repo(tmp_path, branch="feature/docs")
     config, _ = load_config(repo)
+    config = replace(
+        config, llm=replace(config.llm, opencode_cli_generation=generation)
+    )
     context = build_context(repo, config)
     context.opencode_executable = "/usr/local/bin/opencode"
     invocation_error = RunnerProtocolError("invocation failed")
@@ -430,7 +440,9 @@ def test_invocation_error_survives_attachment_cleanup_failure_with_session_ident
     )
 
     with pytest.raises(RunnerProtocolError) as error:
-        OpenCodeRunner().run(_request(context))
+        OpenCodeRunner().run(
+            _request(context, variant="" if generation == "v2" else "profile-variant")
+        )
 
     assert error.value is invocation_error
     assert getattr(error.value, "session_id", None) == "invocation-session"
@@ -809,6 +821,557 @@ def test_finalize_warns_and_deletes_when_export_has_no_transcript(
         "Could not capture or delete the OpenCode session cleanly"
         in capsys.readouterr().err
     )
+
+
+# CLI-generation proofs exercise the real adapter and host policy. Only the
+# process boundary is fake; these are not native parser or isolation proofs.
+def _cli_generation_context(tmp_path, generation):
+    repo = init_repo(tmp_path, branch="feature/cli-generation")
+    config, _ = load_config(repo)
+    if generation is not None:
+        config = replace(
+            config, llm=replace(config.llm, opencode_cli_generation=generation)
+        )
+    context = build_context(repo, config)
+    context.opencode_executable = "/fake-only/selected-opencode"
+    return context
+
+
+@pytest.mark.parametrize("generation", ["legacy", "v2"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "nonzero-export",
+        "empty-export",
+        "truncated-export",
+        "export-exception",
+        "delete-exception",
+        "nonzero-delete",
+    ],
+)
+def test_opencode_cli_generation_finalize_only_exact_argv_and_best_effort(
+    tmp_path, monkeypatch, capsys, generation, failure
+):
+    context = _cli_generation_context(tmp_path, generation)
+    request = _request(context, variant="", artifacts=())
+    calls = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        action = "export" if "export" in argv else "delete"
+        assert argv == _cli_generation_lifecycle(
+            context.opencode_executable, generation, action, "known-sid"
+        )
+        if failure == action + "-exception":
+            raise RunnerTimeoutError("synthetic lifecycle timeout")
+        if failure == "nonzero-" + action:
+            return ProcessResult(3, "", "")
+        return ProcessResult(
+            0,
+            ""
+            if failure == "empty-export"
+            else '{"info":{"id":"known-sid"},"messages":[]}',
+            "",
+            stdout_truncated=failure == "truncated-export" and action == "export",
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    finalized = OpenCodeRunner().finalize(
+        request,
+        RunnerResult("[]", 0, "", "", SessionMetadata("known-sid", "persisted", True)),
+    )
+    assert calls == [
+        _cli_generation_lifecycle(
+            context.opencode_executable, generation, action, "known-sid"
+        )
+        for action in ("export", "delete")
+    ]
+    delete_failed = failure in {"delete-exception", "nonzero-delete"}
+    assert finalized.session.state == ("persisted" if delete_failed else "deleted")
+    assert finalized.session.resumable is delete_failed
+    assert (finalized.session.transcript is None) == (
+        failure not in {"none", "delete-exception", "nonzero-delete"}
+    )
+    warning = capsys.readouterr().err
+    assert ("Could not capture or delete" in warning) == (failure != "none")
+
+
+@pytest.mark.parametrize("generation", ["legacy", "v2"])
+@pytest.mark.parametrize(
+    "failure", ["nonzero", "malformed", "missing", "truncated", "timeout"]
+)
+def test_opencode_cli_generation_run_failure_session_and_cleanup(
+    tmp_path, monkeypatch, generation, failure
+):
+    context = _cli_generation_context(tmp_path, generation)
+    request = _request(context, variant="", resume_session=True, session_id="known-sid")
+    calls = []
+    paths = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        paths.extend(
+            pathlib.Path(argv[i + 1]) for i, item in enumerate(argv) if item == "--file"
+        )
+        assert argv[4] == ("--standalone" if generation == "v2" else "--pure")
+        prefix = '{"type":"session.created","sessionID":"known-sid"}\n'
+        if failure == "timeout":
+            error = RunnerTimeoutError("synthetic timeout")
+            error._process_result = ProcessResult(-9, prefix, "")
+            raise error
+        stdout = prefix + (
+            "not-json"
+            if failure in {"malformed", "nonzero"}
+            else '{"type":"step_start"}'
+        )
+        return ProcessResult(
+            7 if failure == "nonzero" else 0,
+            stdout,
+            "",
+            stdout_truncated=failure == "truncated",
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    expected = (
+        RunnerTimeoutError
+        if failure == "timeout"
+        else RunnerMissingOutputError
+        if failure == "missing"
+        else RunnerError
+        if failure == "nonzero"
+        else RunnerProtocolError
+    )
+    with pytest.raises(expected) as error:
+        OpenCodeRunner().run(request)
+    assert getattr(error.value, "session_id", None) == "known-sid"
+    assert len(calls) == 1
+    assert paths and all(not path.exists() for path in paths)
+
+
+def _cli_generation_lifecycle(executable, generation, action, sid):
+    if generation == "v2":
+        return [executable, "session", action, "--standalone", sid]
+    if action == "export":
+        return [executable, "export", sid, "--pure"]
+    return [executable, "session", "delete", sid, "--pure"]
+
+
+def test_opencode_cli_generation_shared_adapter_keeps_request_local_selection(
+    tmp_path, monkeypatch
+):
+    contexts = [
+        _cli_generation_context(tmp_path / generation, generation)
+        for generation in ("legacy", "v2")
+    ]
+    requests = [_request(context, variant="", artifacts=()) for context in contexts]
+    runner = OpenCodeRunner()
+    calls = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        index = 0 if "--pure" in argv else 1
+        assert ("--standalone" in argv) is (index == 1)
+        assert kwargs["env"]["HOME"].startswith(str(contexts[index].run_dir))
+        if argv[1] == "run":
+            return ProcessResult(
+                0,
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": f"sid-{index}",
+                        "part": {"text": "[]"},
+                    }
+                ),
+                "",
+            )
+        action = "export" if "export" in argv else "delete"
+        assert argv == _cli_generation_lifecycle(
+            contexts[index].opencode_executable,
+            ("legacy", "v2")[index],
+            action,
+            f"sid-{index}",
+        )
+        return ProcessResult(0, '{"info":{},"messages":[]}', "")
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    results = [runner.run(request) for request in requests]
+    # Finalizing legacy AFTER a V2 run must not inherit another invocation's
+    # generation, stage root or identity on the singleton-compatible adapter.
+    for request, result in zip(requests, results):
+        assert runner.finalize(request, result).session.state == "deleted"
+    assert len(calls) == 6
+
+
+@pytest.mark.parametrize("generation", [None, "legacy", "v2"])
+@pytest.mark.parametrize("mode", ["artifacts", "project", "apply"])
+@pytest.mark.parametrize("resumed", [False, True])
+def test_opencode_cli_generation_exact_run_and_unchanged_host_policy(
+    tmp_path, monkeypatch, generation, mode, resumed
+):
+    import os
+    import stat
+
+    context = _cli_generation_context(tmp_path, generation)
+    staging = tmp_path / "non-vcs-stage"
+    staging.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "fake-provider-data"))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-only")
+    monkeypatch.setenv("OPENCODE_CONFIG", "/fake-only/unwanted.json")
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-filter-me")
+    request = _request(
+        context,
+        variant="" if generation == "v2" else "profile-variant",
+        instruction="--leading-dash prompt\nexact",
+        mode="apply" if mode == "apply" else "ask",
+        project_access="project" if mode == "project" else "artifacts",
+        cwd=staging if mode == "apply" else context.repo_root,
+        allow_paths=("README.md", "docs/**/*.md") if mode == "apply" else (),
+        model="opaque/model#native",
+        resume_session=resumed,
+        session_id="opaque-sid" if resumed else None,
+        artifacts=(
+            RunnerArtifact("first.txt", "snapshot-1\n"),
+            RunnerArtifact("second.txt", "snapshot-2\n"),
+        ),
+    )
+    calls = []
+    environments = []
+    attachment_paths = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        environments.append(dict(kwargs["env"]))
+        paths = [
+            pathlib.Path(argv[i + 1]) for i, arg in enumerate(argv) if arg == "--file"
+        ]
+        attachment_paths.extend(paths)
+        assert len(paths) == 2
+        assert [path.name for path in paths] == ["0001-first.txt", "0002-second.txt"]
+        assert [path.read_bytes() for path in paths] == [
+            b"snapshot-1\n",
+            b"snapshot-2\n",
+        ]
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths)
+        agent = "ai-push-hooks-apply" if mode == "apply" else "ai-push-hooks-readonly"
+        expected = [
+            context.opencode_executable,
+            "run",
+            "--agent",
+            agent,
+            "--standalone" if generation == "v2" else "--pure",
+            "--format",
+            "json",
+            "--model",
+            "opaque/model#native",
+        ]
+        if generation != "v2":
+            expected += ["--variant", "profile-variant"]
+        expected += (
+            ["--session", "opaque-sid"]
+            if resumed
+            else ["--title", "ai-push-hooks test-run docs.query"]
+        )
+        expected += [
+            "--file",
+            str(paths[0]),
+            "--file",
+            str(paths[1]),
+            "--",
+            request.instruction,
+        ]
+        assert argv == expected
+        assert kwargs["timeout_seconds"] == 3
+        if mode == "artifacts":
+            assert kwargs["cwd"] != context.repo_root
+            assert list(kwargs["cwd"].iterdir()) == []
+        else:
+            assert (
+                kwargs["cwd"]
+                == (staging if mode == "apply" else context.repo_root).resolve()
+            )
+        return ProcessResult(
+            0, '{"type":"text","sessionID":"opaque-sid","part":{"text":"[]"}}\n', ""
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    runner = OpenCodeRunner()
+    result = runner.run(request)
+    assert result.session.session_id == "opaque-sid"
+    assert len(calls) == 1
+    assert all(not path.exists() for path in attachment_paths)
+    env = environments[0]
+    isolation = context.run_dir / "opencode-isolation" / "docs.query"
+    roots = {
+        "HOME": "home",
+        "XDG_CONFIG_HOME": "config",
+        "XDG_CACHE_HOME": "cache",
+        "XDG_STATE_HOME": "state",
+        "OPENCODE_CONFIG_DIR": "config",
+    }
+    for key, leaf in roots.items():
+        assert env[key] == str(isolation / leaf)
+        assert stat.S_IMODE(pathlib.Path(env[key]).stat().st_mode) == 0o700
+    permissions = {
+        tool: "deny"
+        for tool in (
+            "*",
+            "read",
+            "glob",
+            "grep",
+            "list",
+            "edit",
+            "bash",
+            "task",
+            "external_directory",
+            "webfetch",
+            "websearch",
+            "lsp",
+            "skill",
+            "todowrite",
+            "question",
+            "doom_loop",
+        )
+    }
+    if mode == "project":
+        permissions.update({tool: "allow" for tool in ("read", "list", "glob", "grep")})
+    if mode == "apply":
+        prefix = staging.relative_to(staging.anchor).as_posix()
+        permissions["read"] = "allow"
+        permissions["edit"] = {
+            "*": "deny",
+            f"{prefix}/README.md": "allow",
+            f"{prefix}/docs/**/*.md": "allow",
+            f"{prefix}/docs/*.md": "allow",
+            f"{prefix}/.git": "deny",
+            f"{prefix}/.git/**": "deny",
+        }
+    agent = "ai-push-hooks-apply" if mode == "apply" else "ai-push-hooks-readonly"
+    policy = {
+        "$schema": "https://opencode.ai/config.json",
+        "plugin": [],
+        "mcp": {},
+        "share": "disabled",
+        "instructions": [],
+        "formatter": False,
+        "lsp": False,
+        "command": {},
+        "agent": {
+            agent: {
+                "mode": "primary",
+                "description": "Path-restricted ai-push-hooks apply agent"
+                if mode == "apply"
+                else "Read-only ai-push-hooks analysis agent",
+                "permission": permissions,
+            }
+        },
+    }
+    assert env["OPENCODE_CONFIG_CONTENT"] == json.dumps(policy, ensure_ascii=True)
+    expected_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {"PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT"}
+        or key.startswith(
+            (
+                "ANTHROPIC_",
+                "AWS_",
+                "AZURE_",
+                "COHERE_",
+                "DEEPSEEK_",
+                "GEMINI_",
+                "GOOGLE_",
+                "GROQ_",
+                "MISTRAL_",
+                "OPENAI_",
+                "OPENROUTER_",
+                "VERTEX_",
+                "XAI_",
+            )
+        )
+    }
+    expected_env.update({key: str(isolation / leaf) for key, leaf in roots.items()})
+    expected_env.update(
+        XDG_DATA_HOME=str(tmp_path / "fake-provider-data"),
+        OPENCODE_CONFIG_CONTENT=json.dumps(policy, ensure_ascii=True),
+    )
+    for key in (
+        "OPENCODE_PURE",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+        "OPENCODE_DISABLE_CLAUDE_CODE",
+        "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
+        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+        "OPENCODE_DISABLE_LSP_DOWNLOAD",
+        "OPENCODE_DISABLE_SHARE",
+        "OPENCODE_DISABLE_AUTOUPDATE",
+    ):
+        expected_env[key] = "true"
+    assert env == expected_env
+
+
+@pytest.mark.parametrize("generation", [None, "legacy", "v2"])
+@pytest.mark.parametrize(
+    "capture,delete", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_opencode_cli_generation_exact_lifecycle_and_stage_continuity(
+    tmp_path, monkeypatch, generation, capture, delete
+):
+    context = _cli_generation_context(tmp_path, generation)
+    context.config = replace(
+        context.config,
+        logging=replace(context.config.logging, capture_llm_transcript=capture),
+        llm=replace(context.config.llm, delete_session_after_run=delete),
+    )
+    request = _request(context, variant="", artifacts=())
+    calls = []
+    envs = []
+    export = '{"info":{"id":"opaque-sid"},"messages":[]}'
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        envs.append(dict(kwargs["env"]))
+        assert kwargs["timeout_seconds"] == request.timeout_seconds
+        assert list(kwargs["cwd"].iterdir()) == []
+        if argv[1] == "run":
+            assert argv == [
+                context.opencode_executable,
+                "run",
+                "--agent",
+                "ai-push-hooks-readonly",
+                "--standalone" if generation == "v2" else "--pure",
+                "--format",
+                "json",
+                "--model",
+                "profile/model",
+                "--title",
+                "ai-push-hooks test-run docs.query",
+                "--",
+                request.instruction,
+            ]
+            return ProcessResult(
+                0, '{"type":"text","sessionID":"opaque-sid","part":{"text":"[]"}}', ""
+            )
+        action = "export" if "export" in argv else "delete"
+        assert argv == _cli_generation_lifecycle(
+            context.opencode_executable, generation, action, "opaque-sid"
+        )
+        return ProcessResult(0, export if action == "export" else "deleted", "")
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    runner = OpenCodeRunner()
+    finalized = runner.finalize(request, runner.run(request))
+    assert calls[1:] == [
+        _cli_generation_lifecycle(
+            context.opencode_executable, generation, action, "opaque-sid"
+        )
+        for action, enabled in (("export", capture), ("delete", delete))
+        if enabled
+    ]
+    non_agent = {
+        "$schema": "https://opencode.ai/config.json",
+        "plugin": [],
+        "mcp": {},
+        "share": "disabled",
+        "instructions": [],
+        "formatter": False,
+        "lsp": False,
+        "command": {},
+        "permission": {"*": "deny"},
+    }
+    for env in envs[1:]:
+        expected = dict(
+            envs[0], OPENCODE_CONFIG_CONTENT=json.dumps(non_agent, ensure_ascii=True)
+        )
+        assert env == expected
+    assert finalized.session.session_id == "opaque-sid"
+    assert finalized.session.state == ("deleted" if delete else "persisted")
+    assert finalized.session.resumable is not delete
+    if capture:
+        transcript = pathlib.Path(finalized.session.transcript)
+        assert transcript.read_text() == export + "\n"
+        assert transcript.stat().st_mode & 0o777 == 0o600
+    else:
+        assert finalized.session.transcript is None
+
+
+@pytest.mark.parametrize("entry", ["run", "finalize", "finalize-without-session"])
+@pytest.mark.parametrize("invalid", ["generation", "variant"])
+def test_opencode_cli_generation_direct_invalid_options_launch_nothing(
+    tmp_path, monkeypatch, entry, invalid
+):
+    from types import SimpleNamespace
+
+    context = _cli_generation_context(tmp_path, "v2")
+    if invalid == "generation":
+        context.config = replace(
+            context.config,
+            llm=SimpleNamespace(
+                **dict(context.config.llm.__dict__, opencode_cli_generation="V2")
+            ),
+        )
+    context.opencode_executable = None
+    calls = []
+    monkeypatch.setattr(
+        "ai_push_hooks.executors.runners.opencode.run_process",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    request = _request(
+        context,
+        variant="high" if invalid == "variant" else "",
+        artifacts=(RunnerArtifact("unreachable", "x", tmp_path / "missing"),),
+    )
+    result = RunnerResult(
+        "[]",
+        0,
+        "",
+        "",
+        None
+        if entry == "finalize-without-session"
+        else SessionMetadata("known", "persisted", True),
+    )
+    with pytest.raises(RunnerContractError, match="generation|variant"):
+        if entry == "run":
+            OpenCodeRunner().run(request)
+        else:
+            OpenCodeRunner().finalize(request, result)
+    assert calls == []
+    assert not (context.run_dir / "opencode-isolation").exists()
+    assert not list(context.run_dir.glob("opencode-attachments-*"))
+
+
+@pytest.mark.parametrize(
+    "generation,count,accepted",
+    [("v2", 101, False), ("v2", 100, True), ("legacy", 101, True)],
+)
+def test_opencode_cli_generation_attachment_limit_before_materialization(
+    tmp_path, monkeypatch, generation, count, accepted
+):
+    context = _cli_generation_context(tmp_path, generation)
+    calls = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        assert argv.count("--file") == count
+        assert argv[-2:] == ["--", "Return a JSON array."]
+        return ProcessResult(0, '{"type":"text","part":{"text":"[]"}}', "")
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    request = _request(
+        context,
+        variant="",
+        artifacts=tuple(RunnerArtifact(f"{i}.txt", "x") for i in range(count)),
+    )
+    if accepted:
+        assert OpenCodeRunner().run(request).final_text == "[]"
+        assert len(calls) == 1
+    else:
+        context.opencode_executable = None
+        with pytest.raises(RunnerContractError, match="100"):
+            OpenCodeRunner().run(request)
+        assert calls == []
+        assert not (context.run_dir / "opencode-isolation").exists()
+    assert not list(context.run_dir.glob("opencode-attachments-*"))
 
 
 def test_finalize_export_process_exception_still_deletes_session(

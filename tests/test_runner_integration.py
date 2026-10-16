@@ -531,3 +531,158 @@ output = "result.json"
             encoding="utf-8"
         )
     ) == ["accepted"]
+
+
+@pytest.mark.parametrize("generation", [None, "legacy", "v2"])
+@pytest.mark.parametrize("new_session", [False, True])
+@pytest.mark.parametrize("retries", [0, 1, 2])
+@pytest.mark.parametrize("outcome", ["correction", "exhausted", "process-failure"])
+def test_opencode_cli_generation_real_workflow_retry_matrix(
+    tmp_path, monkeypatch, generation, new_session, retries, outcome
+):
+    from ai_push_hooks.executors.runners.opencode import OpenCodeRunner
+
+    repo = init_repo(tmp_path, branch="feature/cli-generation")
+    selector = "" if generation is None else f'opencode_cli_generation = "{generation}"'
+    # Exercise implicit default, explicit global and per-step selections with
+    # real config rebuilding and final environment override precedence.
+    selected = "opencode" if retries == 0 else "selected"
+    global_runner = selected if retries != 2 else "opencode"
+    step_runner = 'runner = "selected"' if retries == 2 else ""
+    profiles = (
+        ""
+        if retries == 0
+        else '[runners.selected]\ntype = "opencode"\nmodel = "profile/model"\nvariant = ""'
+    )
+    repo.joinpath("ai-push-hooks.toml").write_text(
+        f'''
+[llm]
+{selector}
+runner = "{global_runner}"
+model = "global/model"
+json_max_retries = {retries}
+json_retry_new_session = {str(new_session).lower()}
+invalid_json_feedback_max_chars = 13
+delete_session_after_run = true
+{profiles}
+[logging]
+capture_llm_transcript = true
+[workflow]
+modules = ["docs"]
+[[modules.docs.steps]]
+id = "query"
+type = "ask"
+schema = "string_array"
+prompt = "--exact workflow prompt"
+output = "result.json"
+{step_runner}
+''',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_PUSH_HOOKS_MODEL", "env/model#native")
+    monkeypatch.setenv("AI_PUSH_HOOKS_VARIANT", "")
+    config, _ = load_config(repo)
+    context = build_context(repo, config)
+    context.opencode_executable = "/fake-only/workflow-opencode"
+    _reset_runner_cache("opencode")
+    assert isinstance(DEFAULT_RUNNER_REGISTRY.get("opencode"), OpenCodeRunner)
+    calls = []
+    run_count = 0
+    bad = "invalid-response-" * 10
+    feedback = (
+        "--exact workflow prompt\n\nIMPORTANT: Your previous response was invalid JSON and could not be parsed.\n"
+        "Parse error: Could not find JSON array in model output\n"
+        "Return ONLY valid JSON array.\nPrevious invalid output:\n```text\n"
+        + bad[:13]
+        + "\n```"
+    )
+    sid = ""
+
+    def lifecycle(action, session):
+        if generation == "v2":
+            return [
+                context.opencode_executable,
+                "session",
+                action,
+                "--standalone",
+                session,
+            ]
+        return (
+            [context.opencode_executable, "export", session, "--pure"]
+            if action == "export"
+            else [context.opencode_executable, "session", "delete", session, "--pure"]
+        )
+
+    def fake(argv, **kwargs):
+        nonlocal run_count, sid
+        calls.append(list(argv))
+        if argv[1] != "run":
+            action = "export" if "export" in argv else "delete"
+            assert argv == lifecycle(action, sid)
+            return ProcessResult(
+                0,
+                json.dumps({"info": {"id": sid}, "messages": []})
+                if action == "export"
+                else "deleted",
+                "",
+            )
+        run_count += 1
+        sid = (
+            f"opaque-session-{run_count}"
+            if new_session or run_count == 1
+            else "opaque-session-1"
+        )
+        expected = [
+            context.opencode_executable,
+            "run",
+            "--agent",
+            "ai-push-hooks-readonly",
+            "--standalone" if generation == "v2" else "--pure",
+            "--format",
+            "json",
+            "--model",
+            "env/model#native",
+        ]
+        expected += (
+            ["--session", sid]
+            if run_count > 1 and not new_session
+            else ["--title", "ai-push-hooks test-run docs.query"]
+        )
+        expected += ["--", "--exact workflow prompt" if run_count == 1 else feedback]
+        assert argv == expected
+        assert kwargs["timeout_seconds"] == config.llm.timeout_seconds
+        assert list(kwargs["cwd"].iterdir()) == []
+        text = '["accepted"]' if outcome == "correction" and run_count == 2 else bad
+        return ProcessResult(
+            7 if outcome == "process-failure" else 0,
+            json.dumps({"type": "text", "sessionID": sid, "part": {"text": text}}),
+            "",
+        )
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", fake)
+    succeeds = outcome == "correction" and retries > 0
+    if succeeds:
+        WorkflowEngine(context, ArtifactStore(context.run_dir)).run()
+        assert json.loads(
+            context.run_dir.joinpath("docs/00-query/result.json").read_text()
+        ) == ["accepted"]
+    else:
+        with pytest.raises(
+            HookError,
+            match=rf"runner '{selected}' \(opencode\) failed"
+            if outcome == "process-failure"
+            else "invalid JSON",
+        ):
+            WorkflowEngine(context, ArtifactStore(context.run_dir)).run()
+    attempts = 1 if outcome == "process-failure" else (2 if succeeds else retries + 1)
+    assert run_count == attempts
+    expected_order = []
+    for attempt in range(1, attempts + 1):
+        expected_order.append("run")
+        if new_session or attempt == attempts:
+            expected_order.extend(["export", "delete"])
+    assert [
+        "run" if argv[1] == "run" else "export" if "export" in argv else "delete"
+        for argv in calls
+    ] == expected_order
+    assert len(calls) == attempts + 2 * (attempts if new_session else 1)

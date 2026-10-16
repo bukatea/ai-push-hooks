@@ -19,10 +19,26 @@ ai-push-hooks does not log environment values, manage credentials, invoke login,
 or provide a credential broker. Do not commit secrets, and review provider
 retention, privacy, and billing policies before use on sensitive repositories.
 
-OpenCode's `--pure` and isolated configuration exclude external plugins,
+The default legacy OpenCode generation's `--pure` and isolated configuration exclude external plugins,
 project/global configuration, MCP servers, instructions, and global custom
 providers while retaining built-in plugins such as Codex OAuth. The default
 OpenCode profile remains artifact-only; project access is an explicit opt-in.
+
+**The opt-in `[llm].opencode_cli_generation = "v2"` is a partial source-only
+CLI-generation candidate targeting 2.0.25, not production-supported V2 or
+qualified `--pure`/permission/plugin isolation equivalence.** `--standalone`
+selects connection ownership, not the legacy pure boundary. V2 can still load
+stored well-known configuration and its plugins from shared data/session storage.
+Isolated HOME/config/cache/state, project-disable flags, `OPENCODE_PURE`, inline
+`plugin: []` and deny/allow permission payloads do **not** establish exclusion of
+that configuration/plugin-loading path. Shared provider data is intentionally
+unchanged; no credential copying or security-policy redesign is included.
+The inherited host-side environment, staging, allowlist and private-artifact
+controls are retained, but effective V2 permission enforcement, config/plugin
+exclusion and native lifecycle behavior are unqualified. Fake-process source
+checks are not native isolation/retention acceptance. Default legacy behavior
+and its guarantees are unchanged; this candidate does not authorize adoption or
+release. See [the limited setting](docs/configuration.md#opencode-cli-generation-partial-source-only).
 
 Hook logs, summaries, run artifacts, and OpenCode transcripts are stored locally
 under `.git/ai-push-hooks/` with private runtime permissions. Transcript capture

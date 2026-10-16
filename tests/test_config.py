@@ -9,9 +9,177 @@ from ai_push_hooks import config as config_module
 from ai_push_hooks.artifacts import generate_run_id
 from ai_push_hooks.config import load_config, resolve_runner_profile
 from ai_push_hooks import git_utils
-from ai_push_hooks.types import HookError
+from ai_push_hooks.types import HookError, LlmConfig, StepConfig
 
 from .conftest import init_repo
+
+
+def _opencode_cli_generation_document(llm: str, profiles: str = "") -> str:
+    return f"""
+[llm]
+{llm}
+{profiles}
+[workflow]
+modules = ["docs"]
+[[modules.docs.steps]]
+id = "query"
+type = "ask"
+schema = "string_array"
+prompt = "Return []."
+output = "result.json"
+"""
+
+
+@pytest.fixture
+def opencode_cli_generation_no_launch(monkeypatch):
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        calls.append(args)
+        pytest.fail("config validation must not launch OpenCode")
+
+    monkeypatch.setattr(
+        "ai_push_hooks.executors.runners.opencode.run_process", unexpected
+    )
+    yield calls
+    assert calls == []
+
+
+@pytest.mark.parametrize("generation", [None, "legacy", "v2"])
+@pytest.mark.parametrize("selection", ["implicit", "explicit", "step", "codex"])
+def test_opencode_cli_generation_load_and_effective_rebuild(
+    tmp_path, monkeypatch, generation, selection, opencode_cli_generation_no_launch
+):
+    llm = "" if generation is None else f'opencode_cli_generation = "{generation}"'
+    profiles = ""
+    if selection != "implicit":
+        kind = "codex" if selection == "codex" else "opencode"
+        profiles = f'[runners.selected]\ntype = "{kind}"\nmodel = "profile/model"'
+        if selection != "step":
+            llm += '\nrunner = "selected"'
+    (tmp_path / "ai-push-hooks.toml").write_text(
+        _opencode_cli_generation_document(llm, profiles), encoding="utf-8"
+    )
+    monkeypatch.setenv("AI_PUSH_HOOKS_MODEL", "opaque/model#native")
+    monkeypatch.setenv("AI_PUSH_HOOKS_TIMEOUT_SECONDS", "17")
+    # No generation environment override is supported.
+    monkeypatch.setenv("AI_PUSH_HOOKS_OPENCODE_CLI_GENERATION", "not-a-generation")
+    config, _ = load_config(tmp_path)
+    assert config.llm.opencode_cli_generation == (generation or "legacy")
+    assert config.llm.timeout_seconds == 17
+    step = StepConfig(
+        "query", "ask", runner="selected" if selection == "step" else None
+    )
+    profile = resolve_runner_profile(config, step)
+    assert profile.model == "opaque/model#native"
+    assert profile.type == ("codex" if selection == "codex" else "opencode")
+
+
+@pytest.mark.parametrize("value", ["legacy", "v2"])
+def test_opencode_cli_generation_direct_construction(value):
+    assert LlmConfig(opencode_cli_generation=value).opencode_cli_generation == value
+
+
+@pytest.mark.parametrize(
+    "value", ["", "V2", "v2 ", " legacy", "auto", True, False, 2, 2.0, [], None, {}]
+)
+def test_opencode_cli_generation_rejects_invalid_direct_values(
+    value, opencode_cli_generation_no_launch
+):
+    with pytest.raises(HookError, match="opencode_cli_generation.*legacy.*v2"):
+        LlmConfig(opencode_cli_generation=value)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '""',
+        '"V2"',
+        '"v2 "',
+        '" legacy"',
+        '"auto"',
+        "true",
+        "false",
+        "2",
+        "2.0",
+        "[]",
+        "{}",
+    ],
+)
+def test_opencode_cli_generation_rejects_invalid_toml(
+    tmp_path, literal, opencode_cli_generation_no_launch
+):
+    (tmp_path / "ai-push-hooks.toml").write_text(
+        _opencode_cli_generation_document(f"opencode_cli_generation = {literal}"),
+        encoding="utf-8",
+    )
+    with pytest.raises(HookError, match="opencode_cli_generation.*legacy.*v2"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("source", ["llm", "profile", "unselected", "env", "effective"])
+def test_opencode_cli_generation_rejects_v2_variant_every_config_path(
+    tmp_path, monkeypatch, source, opencode_cli_generation_no_launch
+):
+    llm = 'opencode_cli_generation = "v2"'
+    profiles = ""
+    if source == "llm":
+        llm += '\nvariant = "high"'
+    if source in {"profile", "unselected", "effective"}:
+        profiles = '[runners.selected]\ntype = "opencode"\nvariant = ""'
+        if source != "unselected":
+            llm += '\nrunner = "selected"'
+        if source != "effective":
+            profiles = profiles.replace('variant = ""', 'variant = "high"')
+    (tmp_path / "ai-push-hooks.toml").write_text(
+        _opencode_cli_generation_document(llm, profiles), encoding="utf-8"
+    )
+    if source == "effective":
+        config, _ = load_config(tmp_path)
+        with pytest.raises(HookError, match="v2.*variant"):
+            resolve_runner_profile(
+                config, StepConfig("query", "ask"), {"AI_PUSH_HOOKS_VARIANT": "high"}
+            )
+    else:
+        if source == "env":
+            monkeypatch.setenv("AI_PUSH_HOOKS_VARIANT", "high")
+        with pytest.raises(HookError, match="v2.*variant"):
+            load_config(tmp_path)
+
+
+@pytest.mark.parametrize("variant", ["", "high"])
+def test_opencode_cli_generation_direct_variant_validation(variant):
+    if variant:
+        with pytest.raises(HookError, match="v2.*variant"):
+            LlmConfig(opencode_cli_generation="v2", variant=variant)
+    else:
+        assert LlmConfig(opencode_cli_generation="v2", variant=variant).variant == ""
+
+
+def test_opencode_cli_generation_empty_variant_and_non_opencode_env(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "ai-push-hooks.toml").write_text(
+        _opencode_cli_generation_document(
+            'opencode_cli_generation = "v2"', '[runners.selected]\ntype = "codex"'
+        ),
+        encoding="utf-8",
+    )
+    config, _ = load_config(tmp_path)
+    assert (
+        resolve_runner_profile(
+            config, StepConfig("q", "ask"), {"AI_PUSH_HOOKS_VARIANT": ""}
+        ).variant
+        == ""
+    )
+    assert (
+        resolve_runner_profile(
+            config,
+            StepConfig("q", "ask", runner="selected"),
+            {"AI_PUSH_HOOKS_VARIANT": "high"},
+        ).variant
+        is None
+    )
 
 
 def test_load_config_requires_config_file(tmp_path: pathlib.Path) -> None:

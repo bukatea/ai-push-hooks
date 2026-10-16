@@ -48,6 +48,7 @@ GENERAL_KEYS = {
     "base_branch",
 }
 LLM_KEYS = {
+    "opencode_cli_generation",
     "runner",
     "model",
     "variant",
@@ -264,6 +265,12 @@ def _validate_runner_profiles(
         _validate_string(profile, "variant", label)
         if "variant" in profile:
             _validate_no_control_chars(profile["variant"], f"{label}.variant")
+        if (
+            runner_type == "opencode"
+            and raw.get("llm", {}).get("opencode_cli_generation", "legacy") == "v2"
+            and profile.get("variant")
+        ):
+            raise HookError(f"OpenCode v2 does not support {label}.variant")
         _validate_string(profile, "project_access", label)
         _validate_string(profile, "prompt_transport", label)
         if (
@@ -579,6 +586,7 @@ def _validate_config_types(raw: dict[str, Any]) -> None:
 
     llm = _require_table(raw.get("llm", {}), "llm")
     _validate_unknown_keys(llm, LLM_KEYS, "llm")
+    LlmConfig(opencode_cli_generation=llm.get("opencode_cli_generation", "legacy"))
     for key in ("runner", "model", "variant", "session_title_prefix"):
         _validate_string(llm, key, "llm")
     _validate_non_empty_string(llm, "runner", "llm")
@@ -938,6 +946,8 @@ def resolve_runner_profile(
         _validate_variant_override(variant_override)
         if variant_override is not None:
             variant = variant_override.strip()
+        if config.llm.opencode_cli_generation == "v2" and variant:
+            raise HookError("OpenCode v2 does not support a separate variant option")
 
     return RunnerProfile(
         name=selected_name,
