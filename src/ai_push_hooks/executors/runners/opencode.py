@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from .opencode_support import (
@@ -51,6 +52,21 @@ from .contracts import (
 from .process import run_process
 
 
+@dataclass(frozen=True, repr=False)
+class _RetentionState:
+    """Evidence owned by one call, never by the registry-cached adapter."""
+
+    request: RunnerRequest
+    directory: pathlib.Path
+    receipt: dict[str, Any]
+
+
+@dataclass(frozen=True, repr=False)
+class _RetainedResult(RunnerResult):
+    # The result bridges run() and finalize(), even on different worker threads.
+    retention: _RetentionState | None = field(default=None, repr=False)
+
+
 class OpenCodeRunner:
     """Run one isolated OpenCode invocation and optionally finalize its session."""
 
@@ -69,14 +85,15 @@ class OpenCodeRunner:
             )
         )
 
-    def _receipt(self) -> None:
+    def _receipt(self, state: _RetentionState) -> None:
         atomic_write_bytes(
-            self._retention_dir / "receipt.json",
-            json.dumps(self._retention, sort_keys=True).encode("utf-8"),
+            state.directory / "receipt.json",
+            json.dumps(state.receipt, sort_keys=True).encode("utf-8"),
         )
 
     def _capture(
         self,
+        state: _RetentionState,
         completed: ProcessResult | None,
         action: str,
         error: BaseException | None = None,
@@ -85,7 +102,7 @@ class OpenCodeRunner:
             "available": completed is not None,
             "exception": type(error).__name__ if error else None,
         }
-        self._retention[action] = metadata
+        state.receipt[action] = metadata
         if completed is not None:
             metadata.update(
                 returncode=completed.returncode,
@@ -95,12 +112,12 @@ class OpenCodeRunner:
                 stderr_truncated=completed.stderr_truncated,
             )
             atomic_write_bytes(
-                self._retention_dir / f"{action}.stdout", completed.stdout_bytes
+                state.directory / f"{action}.stdout", completed.stdout_bytes
             )
             atomic_write_bytes(
-                self._retention_dir / f"{action}.stderr", completed.stderr_bytes
+                state.directory / f"{action}.stderr", completed.stderr_bytes
             )
-        self._receipt()
+        self._receipt(state)
 
     @staticmethod
     def _complete_process(completed: ProcessResult) -> str:
@@ -139,7 +156,9 @@ class OpenCodeRunner:
             return any(OpenCodeRunner._has_error(item) for item in value)
         return False
 
-    def _parse_required(self, raw: str, request: RunnerRequest) -> tuple[str, str]:
+    def _parse_required(
+        self, raw: str, request: RunnerRequest, state: _RetentionState
+    ) -> tuple[str, str]:
         ids: set[str] = set()
         message_ids: set[str] = set()
         texts: list[str] = []
@@ -189,13 +208,13 @@ class OpenCodeRunner:
                 "Required OpenCode retention: missing final text"
             )
         sid = next(iter(ids))
-        self._retention.update(
+        state.receipt.update(
             session_id=sid,
             message_ids=sorted(message_ids),
             run_validated=True,
             outcome="retained",
         )
-        self._receipt()
+        self._receipt(state)
         return sid, text
 
     def _finalize_required(
@@ -203,23 +222,33 @@ class OpenCodeRunner:
     ) -> RunnerResult:
         context = self._context(request)
         if (
-            not getattr(self, "_retention", {}).get("run_validated")
+            not isinstance(result, _RetainedResult)
+            or result.retention is None
+            or result.retention.request is not request
+            or not result.retention.receipt.get("run_validated")
             or result.returncode != 0
         ):
             raise RequiredRetentionError(
                 "Required OpenCode retention: failed run retained; deletion forbidden"
             )
-        sid = self._retention["session_id"]
-        executable = self._retention["executable"]
+        state = result.retention
+        sid = state.receipt["session_id"]
+        if result.session is None or result.session.session_id != sid:
+            raise RequiredRetentionError(
+                "Required OpenCode retention: result identity mismatch; deletion forbidden"
+            )
+        executable = state.receipt["executable"]
         try:
             try:
                 exported = self._lifecycle_process(
                     request, context, [executable, "export", sid, "--pure"], "export"
                 )
             except Exception as exc:
-                self._capture(getattr(exc, "_process_result", None), "export", exc)
+                self._capture(
+                    state, getattr(exc, "_process_result", None), "export", exc
+                )
                 raise
-            self._capture(exported, "export")
+            self._capture(state, exported, "export")
             payload = json.loads(self._complete_process(exported))
             if (
                 not isinstance(payload, dict)
@@ -279,20 +308,20 @@ class OpenCodeRunner:
                                 "Required OpenCode retention: invalid tool content"
                             )
                     assistant_ids.add(message["id"])
-            if not set(self._retention["message_ids"]).issubset(assistant_ids):
+            if not set(state.receipt["message_ids"]).issubset(assistant_ids):
                 raise RequiredRetentionError(
                     "Required OpenCode retention: missing export correlation"
                 )
-            self._retention["export_validated"] = True
+            state.receipt["export_validated"] = True
             deleting = context.config.llm.delete_session_after_run
-            self._retention.update(
+            state.receipt.update(
                 delete_action="intent" if deleting else "not requested",
                 outcome="retained",
             )
-            self._receipt()
+            self._receipt(state)
             if deleting:
-                self._retention.update(delete_action="attempted", outcome="unknown")
-                self._receipt()
+                state.receipt.update(delete_action="attempted", outcome="unknown")
+                self._receipt(state)
                 try:
                     deleted = self._lifecycle_process(
                         request,
@@ -301,12 +330,14 @@ class OpenCodeRunner:
                         "delete",
                     )
                 except Exception as exc:
-                    self._capture(getattr(exc, "_process_result", None), "delete", exc)
+                    self._capture(
+                        state, getattr(exc, "_process_result", None), "delete", exc
+                    )
                     raise
-                self._capture(deleted, "delete")
+                self._capture(state, deleted, "delete")
                 self._complete_process(deleted)
-                self._retention["outcome"] = "deleted"
-            self._receipt()
+                state.receipt["outcome"] = "deleted"
+            self._receipt(state)
             return RunnerResult(
                 final_text=result.final_text,
                 returncode=result.returncode,
@@ -316,15 +347,15 @@ class OpenCodeRunner:
                     session_id=sid,
                     state="deleted" if deleting else "persisted",
                     resumable=not deleting,
-                    transcript=str(self._retention_dir / "export.stdout"),
+                    transcript=str(state.directory / "export.stdout"),
                 ),
             )
         except Exception as exc:
-            self._retention["lifecycle_error"] = type(exc).__name__
-            if self._retention.get("outcome") == "deleted":
-                self._retention["outcome"] = "unknown"
+            state.receipt["lifecycle_error"] = type(exc).__name__
+            if state.receipt.get("outcome") == "deleted":
+                state.receipt["outcome"] = "unknown"
             try:
-                self._receipt()
+                self._receipt(state)
             except Exception as receipt_error:
                 error = RequiredRetentionError(
                     "Required OpenCode retention: lifecycle and receipt failed; outcome unknown"
@@ -579,6 +610,7 @@ class OpenCodeRunner:
             )
         context = self._context(request)
         required = self._required(request)
+        state: _RetentionState | None = None
         if required:
             if (
                 not context.config.logging.capture_llm_transcript
@@ -598,24 +630,28 @@ class OpenCodeRunner:
                     else context.repo_root.joinpath(*parts)
                 )
                 ensure_private_directory(root, durable=True)
-                self._retention_dir = (
+                directory = (
                     root
                     / f"{sanitize_filename_component(context.run_id)}-{sanitize_filename_component(request.stage)}-{uuid.uuid4().hex}"
                 )
                 ensure_private_directory(
-                    self._retention_dir, private_root=root, durable=True, exclusive=True
+                    directory, private_root=root, durable=True, exclusive=True
                 )
-                self._retention = {
-                    "run_id": context.run_id,
-                    "stage": request.stage,
-                    "resume_session": request.session_id
-                    if request.resume_session
-                    else None,
-                    "run_validated": False,
-                    "delete_action": "not attempted",
-                    "outcome": "unknown",
-                }
-                self._receipt()
+                state = _RetentionState(
+                    request,
+                    directory,
+                    {
+                        "run_id": context.run_id,
+                        "stage": request.stage,
+                        "resume_session": request.session_id
+                        if request.resume_session
+                        else None,
+                        "run_validated": False,
+                        "delete_action": "not attempted",
+                        "outcome": "unknown",
+                    },
+                )
+                self._receipt(state)
             except Exception as exc:
                 raise RequiredRetentionError(
                     "Required OpenCode retention: storage unavailable"
@@ -661,8 +697,8 @@ class OpenCodeRunner:
             or resolve_opencode_executable()
         )
         isolated_env = opencode_isolation_env(context, security_config, request.stage)
-        if required:
-            self._retention["executable"] = executable
+        if state is not None:
+            state.receipt["executable"] = executable
         attachment_dir: pathlib.Path | None = None
         session_id: str | None = None
         try:
@@ -693,7 +729,7 @@ class OpenCodeRunner:
                     if required:
                         try:
                             self._capture(
-                                getattr(exc, "_process_result", None), "run", exc
+                                state, getattr(exc, "_process_result", None), "run", exc
                             )
                         except Exception as secondary:
                             error = RequiredRetentionError(
@@ -706,7 +742,7 @@ class OpenCodeRunner:
                         ) from exc
                     raise
                 if required:
-                    self._capture(completed, "run")
+                    self._capture(state, completed, "run")
                     self._complete_process(completed)
                 if getattr(completed, "stdout_truncated", False) or getattr(
                     completed, "stderr_truncated", False
@@ -765,13 +801,13 @@ class OpenCodeRunner:
                 )
                 raise
             session_id, final_text = (
-                self._parse_required(completed.stdout, request)
+                self._parse_required(completed.stdout, request, state)
                 if required
                 else self._parse_output(completed.stdout, request)
             )
             if request.resume_session and session_id is None:
                 session_id = request.session_id
-            return RunnerResult(
+            result = RunnerResult(
                 final_text=require_final_text(final_text, mode=request.mode),
                 returncode=completed.returncode,
                 stdout=completed.stdout,
@@ -784,11 +820,21 @@ class OpenCodeRunner:
                     else SessionMetadata()
                 ),
             )
+            if state is not None:
+                return _RetainedResult(
+                    final_text=result.final_text,
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    session=result.session,
+                    retention=state,
+                )
+            return result
         except Exception as exc:
-            if required:
-                self._retention["run_error"] = type(exc).__name__
+            if state is not None:
+                state.receipt["run_error"] = type(exc).__name__
                 try:
-                    self._receipt()
+                    self._receipt(state)
                 except Exception as secondary:
                     error = RequiredRetentionError(
                         "Required OpenCode retention: run and receipt failed; outcome unknown"

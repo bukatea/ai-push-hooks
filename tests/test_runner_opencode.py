@@ -4,6 +4,7 @@ import json
 import pathlib
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -101,6 +102,190 @@ def _bytes_result(raw, code=0, **kwargs):
     )
 
 
+def _retention_directory(context):
+    root = context.git_dir / "ai-push-hooks" / "transcripts"
+    directories = list(root.iterdir())
+    assert len(directories) == 1
+    return directories[0]
+
+
+@pytest.mark.parametrize(
+    ("failure", "delete"),
+    [
+        (None, True),
+        (None, False),
+        ("capture", True),
+        ("export", True),
+        ("delete", True),
+        ("completion", True),
+    ],
+)
+def test_shared_runner_concurrent_retention_is_per_invocation(
+    tmp_path, monkeypatch, failure, delete
+):
+    from ai_push_hooks.executors import runner_workflow as workflow
+    from ai_push_hooks.executors.runners import opencode as module
+    from ai_push_hooks.executors.runners.registry import RunnerRegistry
+    from ai_push_hooks.types import RequiredRetentionError, StepConfig
+
+    context, event, export = _strict_fixture(tmp_path)
+    context.config = replace(
+        context.config,
+        llm=replace(context.config.llm, delete_session_after_run=delete),
+    )
+    contexts = {}
+    streams = {}
+    exports = {}
+    for name in ("a", "b"):
+        contexts[name] = replace(
+            context, run_id=f"run-{name}", opencode_executable=f"/fixture/{name}"
+        )
+        own_event = json.loads(json.dumps(event))
+        own_event["sessionID"] = own_event["part"]["sessionID"] = f"s-{name}"
+        own_event["part"]["messageID"] = f"msg-{name}"
+        streams[name] = ("  " + json.dumps(own_event) + "\n\n").encode()
+        own_export = json.loads(json.dumps(export))
+        own_export["info"]["id"] = f"s-{name}"
+        own_export["messages"][0]["id"] = f"msg-{name}"
+        exports[name] = ("\n" + json.dumps(own_export, indent=2) + "\n").encode()
+
+    registry = RunnerRegistry()
+    monkeypatch.setattr(workflow, "get_runner", registry.get)
+    a_in_process = threading.Event()
+    b_run_complete = threading.Event()
+    a_finished = threading.Event()
+    calls = []
+    trace = []
+    original_write = module.atomic_write_bytes
+
+    def write(path, content, **kwargs):
+        if path.parent.name.startswith("run-a-"):
+            receipt = json.loads(content) if path.name == "receipt.json" else {}
+            if (failure == "capture" and path.name == "run.stdout") or (
+                failure == "completion" and receipt.get("outcome") == "deleted"
+            ):
+                raise OSError("fixture durable write failure")
+        return original_write(path, content, **kwargs)
+
+    def process(argv, **kwargs):
+        name = pathlib.Path(argv[0]).name
+        action = "delete" if argv[1] == "session" else argv[1]
+        calls.append((name, action, tuple(argv), kwargs["env"]["XDG_DATA_HOME"]))
+        trace.append(f"{name}:{action}")
+        if action == "run":
+            if name == "a":
+                a_in_process.set()
+                assert b_run_complete.wait(5), "B must finish run while A is in flight"
+            else:
+                assert a_in_process.wait(5), "A must enter run before B returns"
+            return _bytes_result(streams[name])
+        sid = argv[2] if action == "export" else argv[3]
+        owner = sid.removeprefix("s-")
+        if action == "export":
+            raw = b"{}" if name == "a" and failure == "export" else exports[owner]
+            return _bytes_result(raw)
+        return _bytes_result(b"", 1 if name == "a" and failure == "delete" else 0)
+
+    monkeypatch.setattr(module, "run_process", process)
+    monkeypatch.setattr(module, "atomic_write_bytes", write)
+
+    def invoke(name):
+        try:
+            invocation = workflow._invoke_runner(
+                contexts[name],
+                StepConfig(id=name, type="ask"),
+                "instruction",
+                [],
+                f"docs.{name}",
+                working_directory=context.repo_root,
+            )
+            if name == "b":
+                trace.append("b:run-complete")
+                b_run_complete.set()
+                assert a_finished.wait(5), "B finalizes only after A terminates"
+            return workflow._finalize_invocation(
+                contexts[name], invocation, failed=False
+            )
+        except RequiredRetentionError as exc:
+            return exc
+        finally:
+            if name == "a":
+                trace.append("a:finished")
+                a_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(invoke, "a")
+        assert a_in_process.wait(5), "A owns its state before B starts"
+        b = pool.submit(invoke, "b")
+        results = {"a": a.result(timeout=10), "b": b.result(timeout=10)}
+
+    print("interleaving:", trace)
+    assert trace.index("b:run-complete") < trace.index("a:finished")
+    assert isinstance(registry.get("opencode"), OpenCodeRunner)
+    assert registry.get("opencode") is registry.get("opencode")
+    if failure:
+        assert isinstance(results["a"], RequiredRetentionError)
+    for name in ("b",) if failure else ("a", "b"):
+        result = results[name]
+        assert isinstance(result, RunnerResult)
+        assert result.session.session_id == f"s-{name}"
+        assert result.session.state == ("deleted" if delete else "persisted")
+
+    root = context.git_dir / "ai-push-hooks" / "transcripts"
+    directories = {
+        name: list(root.glob(f"run-{name}-docs.{name}-*")) for name in contexts
+    }
+    assert all(len(paths) == 1 for paths in directories.values())
+    for name in contexts:
+        directory = directories[name][0]
+        receipt = json.loads((directory / "receipt.json").read_bytes())
+        assert receipt["run_id"] == f"run-{name}"
+        assert receipt["stage"] == f"docs.{name}"
+        assert receipt["executable"] == f"/fixture/{name}"
+        if not (name == "a" and failure == "capture"):
+            assert (directory / "run.stdout").read_bytes() == streams[name]
+            assert receipt["session_id"] == f"s-{name}"
+            assert receipt["message_ids"] == [f"msg-{name}"]
+        own_calls = [call for call in calls if call[0] == name]
+        expected = ["run", "export"] + (["delete"] if delete else [])
+        if name == "a" and failure in {"capture", "export"}:
+            expected = expected[: 1 if failure == "capture" else 2]
+        assert [call[1] for call in own_calls] == expected
+        assert len({call[3] for call in own_calls}) == 1
+        for _, action, argv, _ in own_calls[1:]:
+            assert argv[2 if action == "export" else 3] == f"s-{name}"
+        if name == "a" and failure:
+            assert receipt["outcome"] == (
+                "retained" if failure == "export" else "unknown"
+            )
+        else:
+            assert (directory / "export.stdout").read_bytes() == exports[name]
+            assert receipt["export_validated"] is True
+            assert receipt["outcome"] == ("deleted" if delete else "retained")
+            assert receipt["delete_action"] == (
+                "attempted" if delete else "not requested"
+            )
+
+
+def test_required_finalize_rejects_another_requests_result(tmp_path, monkeypatch):
+    from ai_push_hooks.types import RequiredRetentionError
+
+    context, event, _ = _strict_fixture(tmp_path)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        return _bytes_result(json.dumps(event).encode())
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    runner = OpenCodeRunner()
+    request = _request(context)
+    result = runner.run(request)
+    with pytest.raises(RequiredRetentionError):
+        runner.finalize(replace(request, stage="docs.other"), result)
+    assert [argv[1] for argv in calls] == ["run"]
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -159,7 +344,7 @@ def test_required_lifecycle_exact_bytes_and_no_unsafe_deletion(
     else:
         result = runner.finalize(request, result)
         assert result.session.state == ("persisted" if failure else "deleted")
-    directory = runner._retention_dir
+    directory = _retention_directory(context)
     assert (directory / "run.stdout").read_bytes() == raw
     assert (directory / "export.stdout").read_bytes() == exported
     assert directory.stat().st_mode & 0o777 == 0o700
@@ -229,7 +414,7 @@ def test_required_run_failure_keeps_bytes_and_never_deletes(
     with pytest.raises(HookError, match="retention"):
         runner.finalize(request, RunnerResult("", 1, "", ""))
     assert len(calls) == 1
-    assert (runner._retention_dir / "run.stdout").read_bytes() == raw
+    assert (_retention_directory(context) / "run.stdout").read_bytes() == raw
 
 
 @pytest.mark.parametrize(
@@ -277,7 +462,9 @@ def test_required_storage_failure_blocks_success_without_retry(
     )
     if write_failure == "completion":
         assert (
-            json.loads((runner._retention_dir / "receipt.json").read_bytes())["outcome"]
+            json.loads((_retention_directory(context) / "receipt.json").read_bytes())[
+                "outcome"
+            ]
             == "unknown"
         )
 
@@ -377,7 +564,9 @@ def test_strict_delete_ambiguous_outcome(tmp_path, monkeypatch, failure):
     )
     if failure != "attempted_receipt":
         assert (
-            json.loads((runner._retention_dir / "receipt.json").read_bytes())["outcome"]
+            json.loads((_retention_directory(context) / "receipt.json").read_bytes())[
+                "outcome"
+            ]
             == "unknown"
         )
 
@@ -495,7 +684,7 @@ def test_strict_invocation_collision_preserves_prior_evidence(
     monkeypatch.setattr(module, "run_process", process)
     first = OpenCodeRunner()
     first.run(_request(context, stage="docs/a"))
-    directory = first._retention_dir
+    directory = _retention_directory(context)
     sentinel = {path.name: path.read_bytes() for path in directory.iterdir()}
     with pytest.raises(HookError, match="retention"):
         OpenCodeRunner().run(
@@ -552,7 +741,7 @@ def test_strict_failed_process_preserves_original_prefixes(
     with pytest.raises(HookError, match="retention"):
         result = runner.run(request)
         runner.finalize(request, result)
-    directory = runner._retention_dir
+    directory = _retention_directory(context)
     assert (directory / f"{action}.stdout").read_bytes() == stdout
     assert (directory / f"{action}.stderr").read_bytes() == stderr
     receipt = json.loads((directory / "receipt.json").read_bytes())

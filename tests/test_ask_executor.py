@@ -19,6 +19,125 @@ from ai_push_hooks.types import HookError
 from .conftest import build_context, init_repo
 
 
+def test_concurrent_required_asks_keep_inflight_export_owned(tmp_path, monkeypatch):
+    import json
+    import threading
+
+    from ai_push_hooks.artifacts import ArtifactStore
+    from ai_push_hooks.engine import WorkflowEngine
+    from ai_push_hooks.executors import runner_workflow
+    from ai_push_hooks.executors.runners import ProcessResult
+    from ai_push_hooks.executors.runners.registry import RunnerRegistry
+    from ai_push_hooks.types import ModuleConfig, StepConfig, WorkflowConfig
+
+    repo = init_repo(tmp_path, branch="feature/docs")
+    config, _ = load_config(repo)
+    modules = {
+        name: ModuleConfig(
+            id=name,
+            enabled=True,
+            steps=(
+                StepConfig(id="ask", type="ask", prompt=name, schema="string_array"),
+            ),
+        )
+        for name in ("a", "b")
+    }
+    config = replace(
+        config,
+        modules=modules,
+        workflow=WorkflowConfig(modules=("a", "b")),
+        logging=replace(config.logging, require_opencode_retention=True),
+        llm=replace(config.llm, max_parallel=2),
+    )
+    context = build_context(repo, config)
+    context.opencode_executable = "/fixture/opencode"
+    registry = RunnerRegistry()
+    monkeypatch.setattr(runner_workflow, "get_runner", registry.get)
+    a_running = threading.Event()
+    b_exporting = threading.Event()
+    a_deleted = threading.Event()
+    trace = []
+    calls = []
+    streams = {}
+    exports = {}
+    for name in modules:
+        streams[name] = json.dumps(
+            {
+                "type": "text",
+                "sessionID": f"s-{name}",
+                "part": {
+                    "type": "text",
+                    "sessionID": f"s-{name}",
+                    "messageID": f"m-{name}",
+                    "text": json.dumps([name]),
+                },
+            }
+        ).encode()
+        exports[name] = json.dumps(
+            {
+                "info": {"id": f"s-{name}"},
+                "messages": [
+                    {
+                        "type": "assistant",
+                        "id": f"m-{name}",
+                        "content": [{"type": "text", "text": json.dumps([name])}],
+                    }
+                ],
+            }
+        ).encode()
+
+    def process(argv, **kwargs):
+        action = "delete" if argv[1] == "session" else argv[1]
+        name = (
+            argv[-1]
+            if action == "run"
+            else (argv[2] if action == "export" else argv[3]).removeprefix("s-")
+        )
+        trace.append(f"{name}:{action}")
+        calls.append((name, action, kwargs["env"]["XDG_DATA_HOME"]))
+        if action == "run":
+            if name == "a":
+                a_running.set()
+                assert b_exporting.wait(5), "B must be in export before A returns"
+            else:
+                assert a_running.wait(5), "A must be in flight before B returns"
+            raw = streams[name]
+        elif action == "export":
+            if name == "b":
+                b_exporting.set()
+                assert a_deleted.wait(5), "A must delete while B export is in flight"
+            raw = exports[name]
+        else:
+            if name == "a":
+                a_deleted.set()
+            raw = b""
+        return ProcessResult(0, raw.decode(), "", stdout_bytes=raw)
+
+    monkeypatch.setattr("ai_push_hooks.executors.runners.opencode.run_process", process)
+    outcome = WorkflowEngine(context, ArtifactStore(context.run_dir)).run()
+    print("engine interleaving:", trace)
+    assert outcome.modules == {"a": "completed", "b": "completed"}
+    assert trace.index("b:export") < trace.index("a:delete") < trace.index("b:delete")
+    root = context.git_dir / "ai-push-hooks" / "transcripts"
+    for name in modules:
+        assert json.loads(
+            (context.run_dir / name / "00-ask" / "result.json").read_text()
+        ) == [name]
+        directories = list(root.glob(f"{context.run_id}-{name}.ask-*"))
+        assert len(directories) == 1
+        directory = directories[0]
+        receipt = json.loads((directory / "receipt.json").read_bytes())
+        assert receipt["stage"] == f"{name}.ask"
+        assert receipt["session_id"] == f"s-{name}"
+        assert receipt["message_ids"] == [f"m-{name}"]
+        assert receipt["outcome"] == "deleted"
+        assert (directory / "run.stdout").read_bytes() == streams[name]
+        assert (directory / "export.stdout").read_bytes() == exports[name]
+        own_calls = [call for call in calls if call[0] == name]
+        assert [call[1] for call in own_calls] == ["run", "export", "delete"]
+        assert len({call[2] for call in own_calls}) == 1
+
+
 @pytest.mark.parametrize("reuse", [True, False])
 def test_strict_ask_repair_never_bypasses_export(tmp_path, monkeypatch, reuse):
     import json
